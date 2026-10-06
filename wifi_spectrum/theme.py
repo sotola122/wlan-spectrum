@@ -29,7 +29,9 @@ UI_FAMILIES = ["Inter", "Noto Sans CJK JP", "Hiragino Sans", "Yu Gothic UI",
                "Helvetica Neue", "Helvetica", "Arial", "sans-serif"]
 MONO_FAMILIES = ["JetBrains Mono", "Fira Code", "Noto Sans Mono CJK JP", "Menlo",
                  "Consolas", "DejaVu Sans Mono", "monospace"]
-_ASSETS = Path(__file__).with_name("assets").as_posix()
+# Qt stylesheets take forward slashes. The url() values are quoted so a
+# Windows drive prefix (C:) and spaces in the profile path still parse.
+_ASSETS = Path(__file__).with_name("assets").resolve().as_posix()
 
 
 def _css_families(fams: list[str]) -> str:
@@ -152,19 +154,19 @@ def stylesheet() -> str:
     QComboBox:disabled, QSpinBox:disabled {{ color: {C['muted_soft']}; background: {C['canvas_soft']};
                                               border-color: {C['hairline']}; }}
     QComboBox::drop-down {{ border: none; width: 22px; }}
-    QComboBox::down-arrow {{ image: url({_ASSETS}/chevron-down.svg); width: 10px; height: 10px; }}
+    QComboBox::down-arrow {{ image: url("{_ASSETS}/chevron-down.svg"); width: 10px; height: 10px; }}
     QComboBox QAbstractItemView {{ background: {C['card']}; border: 1px solid {C['hairline']};
                                    font-family: {mono}; outline: 0; padding: 4px; }}
     QSpinBox {{ padding-right: 22px; }}
     QSpinBox::up-button, QSpinBox::down-button {{ border: none; width: 18px; background: transparent; }}
-    QSpinBox::up-arrow {{ image: url({_ASSETS}/chevron-up.svg); width: 10px; height: 10px; }}
-    QSpinBox::down-arrow {{ image: url({_ASSETS}/chevron-down.svg); width: 10px; height: 10px; }}
+    QSpinBox::up-arrow {{ image: url("{_ASSETS}/chevron-up.svg"); width: 10px; height: 10px; }}
+    QSpinBox::down-arrow {{ image: url("{_ASSETS}/chevron-down.svg"); width: 10px; height: 10px; }}
 
     QCheckBox {{ spacing: 10px; color: {C['body']}; padding: 3px 0; }}
     QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px;
                             border: 1px solid {C['hairline_strong']}; background: {C['card']}; }}
     QCheckBox::indicator:checked {{ background: {C['ink']}; border-color: {C['ink']};
-                                    image: url({_ASSETS}/check.svg); }}
+                                    image: url("{_ASSETS}/check.svg"); }}
 
     QSlider::groove:horizontal {{ height: 4px; background: {C['hairline']}; border-radius: 2px; }}
     QSlider::sub-page:horizontal {{ background: {C['ink']}; border-radius: 2px; }}

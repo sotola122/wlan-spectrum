@@ -21,24 +21,49 @@ blue→lavender→peach→gold waterfall, mint/gold/error utilization bars). All
 The project is managed with [uv](https://docs.astral.sh/uv/). Dependencies live in
 `pyproject.toml`, exact versions are pinned in `uv.lock` (commit both).
 
+From the repository directory, PowerShell, Command Prompt, and Unix shells use the same commands:
+
 ```bash
-cd wifi-spectrum-gui
 uv sync                                # creates .venv and installs locked deps + the package
 uv run wifi-spectrum --demo            # start in demo mode (omit --demo for normal start)
 # or: uv run python -m wifi_spectrum --demo
 ```
 
-Install uv if needed: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Linux/macOS) or
-`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows).
+`uv run` uses the project environment, so `.venv` does not have to be on `PATH`.
 Requires Python ≥ 3.10; uv downloads a suitable interpreter automatically if none is found.
 
-* **Windows:** the same commands work in PowerShell / cmd (`uv sync`, `uv run wifi-spectrum`).
-  COM ports appear as `COM3` etc.
-* **Linux:** Qt needs some system libs, e.g.
-  `sudo apt install libegl1 libxkbcommon-x11-0 libxcb-cursor0`. For serial access add your
-  user to the `dialout` group. Headless (no display): `QT_QPA_PLATFORM=offscreen`.
+Install uv if needed:
 
-The UI is in English. Inter and JetBrains Mono are used when installed; otherwise Qt falls back to the system sans / monospace.
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Open a new terminal if `uv` is not recognized after install. PowerShell execution policy does not affect `uv sync` or `uv run`.
+
+### Windows
+
+```powershell
+cd path\to\wlan-spectrum
+uv sync
+uv run wifi-spectrum --demo
+```
+
+* **Demo** is the hardware-free path on Windows. It does not open a serial port. The **Demo** button in the window does the same thing.
+* A real board shows up as `COM3`, `COM4`, … in Device Manager under **Ports (COM & LPT)** after the USB-UART driver is installed (ESP32 USB-Serial/JTAG, or a CP210x / CH340 adapter).
+* In the GUI, press refresh, pick that `COMx` name (or type it), leave baud at `921600` unless the firmware uses another rate, and press **Connect**. `COM10` and above are listed in numeric order and opened as `COMx`.
+
+### Linux
+
+Qt needs some system libs, e.g.
+`sudo apt install libegl1 libxkbcommon-x11-0 libxcb-cursor0`. For serial access add your
+user to the `dialout` group. Headless (no display): `QT_QPA_PLATFORM=offscreen`.
+Ports show up as `/dev/ttyUSB0` or `/dev/ttyACM0`.
+
+The UI is in English. Inter and JetBrains Mono are used when installed; otherwise Qt falls back to the system sans / monospace (Consolas and Yu Gothic UI are in the Windows fallback list).
 
 Click **Demo** to fill all three graphs with generated data, or pick a COM
 port, baud rate and press **Connect** for a real device.
@@ -52,12 +77,16 @@ uv build            # → dist/wifi_spectrum_gui-0.1.0-py3-none-any.whl and dist
 The wheel includes `wifi_spectrum/assets/*.svg` and installs the `wifi-spectrum` command
 (e.g. `uv tool install dist/wifi_spectrum_gui-0.1.0-py3-none-any.whl`, or `pip install` it).
 
-### End-to-end serial test without hardware (Linux/macOS)
+### End-to-end serial test without hardware
+
+`--pty` opens a POSIX pseudo-terminal. It runs on Linux and macOS. On Windows the same command exits with a short message and does not open a port.
 
 ```bash
 uv run python -m wifi_spectrum.mock --pty   # prints e.g. "Fake ESP32-C5 on /dev/pts/3"
 uv run wifi-spectrum                        # in another terminal: type /dev/pts/3 in the COM box → Connect
 ```
+
+On Windows, use demo mode instead (`uv run wifi-spectrum --demo`, or the **Demo** button). That feeds the same mock TLV stream into the GUI in-process. This repo does not set up a virtual COM pair.
 
 ## UI
 
@@ -99,7 +128,7 @@ wifi_spectrum/
   assets/         small SVG glyphs (checkbox tick, chevrons) used by the stylesheet
   tlv.py          TLV encode/decode + incremental stream parser
   serial_link.py  QThread serial reader (pyserial) → Qt signals; port listing
-  mock.py         fake device (TLV bytes) for demo mode and --pty serial test
+  mock.py         fake device (TLV bytes); demo mode on every OS, --pty on Linux/macOS
   bands.py        2.4/5 GHz band ranges and channel tables
 ```
 
@@ -115,3 +144,4 @@ wifi_spectrum/
   hump), not a model of real ESP32-C5 CSI/RSSI measurements.
 * 5 GHz grid covers UNII-1…UNII-3 (ch 36–177, 20 MHz centres); DFS/6 GHz are not handled.
 * Pause drops incoming frames (the device keeps streaming).
+* `--pty` is Linux/macOS only. Windows hardware-free runs use Demo mode.

@@ -1,19 +1,24 @@
 """Mock ESP32-C5 device: generates fake Wi-Fi spectra as real TLV bytes.
 
 Used two ways:
-  * In-process demo mode (``MockSource``) - the GUI works without hardware.
-  * Fake serial device on a pseudo-terminal (Linux/macOS)::
+  * In-process demo mode (``MockSource``). Works on Windows, Linux, and macOS::
+
+        uv run wifi-spectrum --demo
+
+  * Fake serial device on a POSIX pseudo-terminal (Linux and macOS)::
 
         python -m wifi_spectrum.mock --pty
 
     then connect the GUI to the printed /dev/pts/N path. This exercises the
-    full SerialReader + TLV path end to end.
+    full SerialReader + TLV path end to end. On Windows ``--pty`` exits with
+    a message; use demo mode there.
 """
 
 from __future__ import annotations
 
 import math
 import random
+import sys
 import time
 
 import numpy as np
@@ -181,11 +186,26 @@ class MockSource(QObject):
         self.stats.emit(self._rx, self._parser.errors)
 
 
+_PTY_UNSUPPORTED = """\
+--pty uses a POSIX pseudo-terminal and runs on Linux and macOS.
+On Windows, start in-process demo mode (no virtual COM driver):
+    uv run wifi-spectrum --demo
+"""
+
+
 def _run_pty() -> None:
     import os
-    import pty
     import select
-    import tty
+
+    if sys.platform == "win32":
+        print(_PTY_UNSUPPORTED, file=sys.stderr, end="")
+        raise SystemExit(2)
+    try:
+        import pty
+        import tty
+    except ImportError:
+        print(_PTY_UNSUPPORTED, file=sys.stderr, end="")
+        raise SystemExit(2)
 
     master, slave = pty.openpty()
     tty.setraw(slave)
@@ -209,7 +229,6 @@ def _run_pty() -> None:
 
 
 if __name__ == "__main__":
-    import sys
     if "--pty" in sys.argv:
         _run_pty()
     else:

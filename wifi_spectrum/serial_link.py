@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 
 import serial
@@ -11,9 +12,20 @@ from PySide6.QtCore import QThread, Signal
 from .tlv import ChannelUtil, Spectrum, Status, TlvParser
 
 
+def _port_sort_key(device: str) -> list:
+    """COM2 before COM10, and ttyUSB2 before ttyUSB10."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", device)]
+
+
 def available_ports() -> list[str]:
-    """Serial port device names (COMx on Windows, /dev/ttyUSB*/ttyACM* on Linux)."""
-    return [p.device for p in sorted(list_ports.comports(), key=lambda p: p.device)]
+    """Serial port device names.
+
+    Windows: ``COM3``, ``COM10``, … (pass that name to ``serial.Serial``;
+    pyserial adds the ``\\\\.\\`` prefix for ports above COM9).
+    Linux: ``/dev/ttyUSB*`` and ``/dev/ttyACM*``.
+    """
+    names = [p.device for p in list_ports.comports() if p.device]
+    return sorted(names, key=_port_sort_key)
 
 
 class SerialReader(QThread):

@@ -238,9 +238,9 @@ class MainWindow(QMainWindow):
 
         self.port_combo = QComboBox()
         self.port_combo.setFixedWidth(124)
-        self.port_combo.setEditable(True)        # allow typing e.g. /dev/pts/3
+        self.port_combo.setEditable(True)        # COM3, /dev/ttyUSB0, or a Linux pty path
         self.port_combo.lineEdit().setPlaceholderText("COM port")
-        self.port_combo.setToolTip("COM port (e.g. COM3, /dev/ttyUSB0)")
+        self.port_combo.setToolTip("Serial port (Windows: COM3; Linux: /dev/ttyUSB0 or /dev/ttyACM0)")
         lay.addWidget(self.port_combo)
         refresh = QPushButton("⟳")
         refresh.setObjectName("icon")
