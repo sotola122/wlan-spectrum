@@ -72,6 +72,7 @@ Mouse wheel / drag zooms and pans the frequency axis on all three plots together
 ## TLV protocol
 
 Every frame: `type u8 | length u16 LE | payload[length]` (all little endian).
+Field layouts, resync rules, and byte examples: [`docs/tlv-protocol.md`](docs/tlv-protocol.md).
 
 | Type | Dir | Payload |
 |---|---|---|
