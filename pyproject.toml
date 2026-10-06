@@ -31,3 +31,9 @@ include = [
     "pyproject.toml",
     "uv.lock",
 ]
+
+[tool.pyright]
+# Mirror pyrightconfig.json so every analyzer entry point (including
+# fallback runners that only read pyproject.toml) resolves the uv venv.
+venvPath = "."
+venv = ".venv"

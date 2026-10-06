@@ -16,6 +16,7 @@ Used two ways:
 
 from __future__ import annotations
 
+import contextlib
 import math
 import random
 import sys
@@ -25,7 +26,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import tlv
-from .bands import BAND_24, BAND_5, BANDS, channel_freq
+from .bands import BAND_5, BAND_24, BANDS, channel_freq
 
 MODE_LIVE, MODE_SWEEP = 0, 1
 
@@ -63,8 +64,8 @@ class MockDevice:
     def configure(self, mode=None, band=None, sweep_ms=None, fft_size=None, sample_rate_khz=None):
         if band is not None and band != self.band:
             self._seg_idx = 0
-        for k, v in dict(mode=mode, band=band, sweep_ms=sweep_ms, fft_size=fft_size,
-                         sample_rate_khz=sample_rate_khz).items():
+        for k, v in {"mode": mode, "band": band, "sweep_ms": sweep_ms,
+                     "fft_size": fft_size, "sample_rate_khz": sample_rate_khz}.items():
             if v is not None:
                 setattr(self, k, v)
 
@@ -205,7 +206,7 @@ def _run_pty() -> None:
         import tty
     except ImportError:
         print(_PTY_UNSUPPORTED, file=sys.stderr, end="")
-        raise SystemExit(2)
+        raise SystemExit(2) from None
 
     master, slave = pty.openpty()
     tty.setraw(slave)
@@ -220,10 +221,8 @@ def _run_pty() -> None:
             now = time.monotonic()
             data = dev.tick(now - last)
             last = now
-            try:
-                os.write(master, data)
-            except BlockingIOError:
-                pass                     # nobody reading - drop frames
+            with contextlib.suppress(BlockingIOError):
+                os.write(master, data)                     # nobody reading - drop frames
     except KeyboardInterrupt:
         pass
 

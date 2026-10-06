@@ -1,8 +1,19 @@
-# ESP32-C5 Wi-Fi Spectrum Analyzer — PC GUI (prototype)
+# ESP32-C5 Wi-Fi Monitor and Spectrum Demo
 
-Desktop GUI (PySide6 + pyqtgraph) for a dual-band (2.4 / 5 GHz)
-Wi-Fi spectrum analyzer built on an ESP32-C5. Data arrives over USB-UART as
-TLV binary frames. A built-in **demo (mock) mode** lets the GUI run without hardware.
+ESP32-C5 firmware and a desktop GUI (PySide6 + pyqtgraph) for dual-band
+(2.4 / 5 GHz) Wi-Fi monitoring. The real device reports AP sightings,
+received-frame RSSI and packet activity over the board's USB-UART bridge using
+CRC32-protected TLV frames. It does not produce an RF FFT or CCA utilization.
+A separate **demo (mock) mode** generates synthetic spectrum/waterfall plots
+without hardware; the screenshots below show Demo, not measured RF spectra.
+
+- [Firmware build and verification](docs/firmware.md): ESP-IDF v6.0.3 through EIM, Podman or Windows wslc.
+- [Real monitor events and measurement semantics](docs/wifi-monitor.md).
+- [TLV framing, CRC32 and CONFIG](docs/tlv-protocol.md).
+
+EIM/Podman builds, USB-UART programming, both-band reception and a ten-minute
+stream have been exercised. Windows wslc and full qualification remain pending;
+see the firmware workflow for current limitations.
 
 ![2.4 GHz live](docs/screenshot_cursor_24.png)
 ![5 GHz band sweep](docs/screenshot_cursor_5.png)
@@ -53,15 +64,16 @@ uv run wifi-spectrum --demo
 ```
 
 * **Demo** is the hardware-free path on Windows. It does not open a serial port. The **Demo** button in the window does the same thing.
-* A real board shows up as `COM3`, `COM4`, … in Device Manager under **Ports (COM & LPT)** after the USB-UART driver is installed (ESP32 USB-Serial/JTAG, or a CP210x / CH340 adapter).
-* In the GUI, press refresh, pick that `COMx` name (or type it), leave baud at `921600` unless the firmware uses another rate, and press **Connect**. `COM10` and above are listed in numeric order and opened as `COMx`.
+* Connect the board's **USB-UART** port (CP2102N on the tested board). It appears as `COM3`, `COM4`, … under **Ports (COM & LPT)** in Device Manager. The native USB-JTAG port does not carry this firmware's data stream.
+* In the GUI, press refresh, pick that `COMx` name (or type it), set baud to **921600**, and press **Connect**. `COM10` and above are listed in numeric order and opened as `COMx`.
 
 ### Linux
 
 Qt needs some system libs, e.g.
 `sudo apt install libegl1 libxkbcommon-x11-0 libxcb-cursor0`. For serial access add your
 user to the `dialout` group. Headless (no display): `QT_QPA_PLATFORM=offscreen`.
-Ports show up as `/dev/ttyUSB0` or `/dev/ttyACM0`.
+The tested CP2102N bridge appears as `/dev/ttyUSB0`; prefer its stable
+`/dev/serial/by-id/` path for scripts. Use **921600 baud**.
 
 The UI is in English. Inter and JetBrains Mono are used when installed; otherwise Qt falls back to the system sans / monospace (Consolas and Yu Gothic UI are in the Windows fallback list).
 
@@ -90,6 +102,14 @@ On Windows, use demo mode instead (`uv run wifi-spectrum --demo`, or the **Demo*
 
 ## UI
 
+The real-device view shows channel-center RSSI points, received packets/s,
+channel observations and AP sightings. It displays effective dwell/cycle timing
+and drop counters; unavailable observations appear as `—`.
+FFT, sample-rate, spectrum peak-hold and waterfall controls are disabled in
+that view. Live updates each channel, while Sweep publishes cycle observations.
+
+The following plot layout is for **Demo**:
+
 | Area | Contents |
 |---|---|
 | Top bar | Live / Band Sweep segmented control, 2.4 GHz / 5 GHz, ▶ Start / Pause, Sweep time (ms), Count (0 = ∞) + progress, Demo, COM port / ⟳ / baud / Connect |
@@ -100,23 +120,27 @@ Mouse wheel / drag zooms and pans the frequency axis on all three plots together
 
 ## TLV protocol
 
-Every frame: `type u8 | length u16 LE | payload[length]` (all little endian).
+Every frame: `type u8 | length u16 LE | payload[length] | crc32 u32 LE`.
+CRC-32/ISO-HDLC covers the exact header and payload; length excludes the
+header and checksum. Both directions require it, with no CRC-less fallback.
 Field layouts, resync rules, and byte examples: [`docs/tlv-protocol.md`](docs/tlv-protocol.md).
 
 | Type | Dir | Payload |
 |---|---|---|
-| `0x01` SPECTRUM | dev→PC | `f_start_mhz f32, f_step_mhz f32, n u16, n × int16 (dBm×100)` |
-| `0x02` CH_UTIL | dev→PC | `band u8 (0=2.4, 1=5), n u8, n × (ch u8, util_pct u8)` |
-| `0x03` STATUS | dev→PC | UTF-8 JSON object (`{...}`) **or** binary `band u8, mode u8, sweep_count u32, uptime_ms u32, temp_c i8` |
-| `0x10` CONFIG | PC→dev | *(proposal)* `mode u8 (0=live,1=sweep), band u8, sweep_ms u16, fft_size u16, sample_rate_khz u32` |
+| `0x01` SPECTRUM | Demo→PC | `f_start_mhz f32, f_step_mhz f32, n u16, n × int16 (dBm×100)` |
+| `0x02` CH_UTIL | Demo→PC | `band u8 (0=2.4, 1=5), n u8, n × (ch u8, util_pct u8)` |
+| `0x03` STATUS | dev→PC | Real firmware: `wifi-monitor/1` JSON events. Codec also supports Demo JSON and binary status. |
+| `0x10` CONFIG | PC→dev | `mode u8 (0=live,1=sweep), band u8, sweep_ms u16, fft_size u16, sample_rate_khz u32` |
 
-* Spectrum frames may cover the whole band (live) or a segment (sweep); the GUI
+* Demo spectrum frames may cover the whole band (live) or a segment (sweep); the GUI
   resamples them onto its display grid (2.4 GHz: 2400–2500 MHz @ 0.5 MHz,
   5 GHz: 5150–5895 MHz @ 1 MHz).
-* In band-sweep mode a sweep is counted complete when a segment reaching the top
+* In Demo band-sweep mode a sweep is counted complete when a segment reaching the top
   of the band arrives; then a waterfall row is added.
 * CONFIG is sent on connect and whenever mode / band / sweep time / FFT / sample
   rate change.
+* Real monitoring uses explicit configuration epochs and cycle events, not the
+  Demo frequency heuristic. Packet rate is not a utilization percentage.
 
 ## Files
 
@@ -124,6 +148,8 @@ Field layouts, resync rules, and byte examples: [`docs/tlv-protocol.md`](docs/tl
 wifi_spectrum/
   __main__.py     entry point (wifi-spectrum / python -m wifi_spectrum [--demo])
   main_window.py  window, plot cards, panels, segmented controls
+  monitor_data.py real-device event validation, epoch/cycle and AP state
+  monitor_widget.py measured RSSI, packet-rate and AP/channel views
   theme.py        DESIGN.md tokens, Qt stylesheet, plot styling, colormaps
   assets/         small SVG glyphs (checkbox tick, chevrons) used by the stylesheet
   tlv.py          TLV encode/decode + incremental stream parser
@@ -134,14 +160,14 @@ wifi_spectrum/
 
 ## Limitations / TODO
 
-* The frame format has no sync word or CRC. The parser resyncs by dropping a byte
-  when it sees an unknown type, an oversized length (>8 KiB) or a payload that fails
-  to decode — fine for a clean USB-CDC link, but a sync byte + CRC16 is recommended
-  for the firmware.
-* FFT size / sample rate are placeholders: they only go out in the proposed CONFIG
-  frame (the mock follows them in sweep mode). The firmware side doesn't exist yet.
+* Every frame has CRC32 but no sync word. Plausible false headers can delay
+  recovery until more bytes arrive; byte-bounded buffering does not guarantee
+  recovery within a fixed time on a stopped stream.
+* Real firmware validates and echoes FFT size/sample rate but cannot acquire
+  raw RF FFT data. Spectrum/waterfall and utilization plots are Demo-only.
 * Mock data is synthetic (OFDM-like masks, duty-cycled APs, BT hops, microwave
   hump), not a model of real ESP32-C5 CSI/RSSI measurements.
-* 5 GHz grid covers UNII-1…UNII-3 (ch 36–177, 20 MHz centres); DFS/6 GHz are not handled.
+* The real JP receive allowlist differs from the Demo grid; see the monitor
+  contract. There is no active DFS radar detection or 6 GHz support.
 * Pause drops incoming frames (the device keeps streaming).
 * `--pty` is Linux/macOS only. Windows hardware-free runs use Demo mode.

@@ -1,0 +1,9 @@
+## wifi_monitor main component dependencies.
+##
+## ESP-IDF v6.0 removed the built-in `json` component; the official migration
+## (docs/en/migration-guides/release-6.x/6.0/protocols.rst) is the
+## espressif/cjson component from the IDF Component Registry. Version range
+## `^1.7.19` matches what ESP-IDF v6.0.3's own examples and test apps pin;
+## the exact resolved version is locked in dependencies.lock.
+dependencies:
+  espressif/cjson: "^1.7.19"

@@ -1,19 +1,25 @@
 # TLV protocol
 
-Shared contract for the ESP32-C5 spectrum analyzer UART link. This document
-describes the frames implemented in `wifi_spectrum/tlv.py` and how
-`wifi_spectrum/main_window.py`, `wifi_spectrum/serial_link.py`,
-`wifi_spectrum/bands.py`, and `wifi_spectrum/mock.py` use them. It is the
-PC-side codec as it exists in this repository. There is no firmware tree here;
-the mock device is the only sender of spectrum, utilization, and status frames.
+Shared byte-stream contract for the ESP32-C5 Wi-Fi monitor and Python GUI.
+The codec is implemented in `wifi_spectrum/tlv.py`; the firmware is in
+`firmware/main/`. Every frame requires CRC32, including Demo frames.
+Old CRC-less senders are incompatible.
+
+Real firmware reports AP sightings, received-frame RSSI and packet counts
+through STATUS JSON, documented in [Wi-Fi monitor events](wifi-monitor.md).
+SPECTRUM, CH_UTIL and binary STATUS remain codec/Demo formats, not measurements
+produced by this firmware. The display grids and spectrum sweep heuristics
+below apply to Demo; real monitoring uses explicit channels and cycle events.
 
 ## 1. Overview
 
 The PC opens a USB-UART port with pyserial (`serial.Serial(port, baud, timeout=0.05)`).
 The GUI baud list is `115200`, `460800`, `921600` (default), and `2000000`.
 Data bits, parity, and stop bits are left at the pyserial defaults: 8 data bits,
-no parity, 1 stop bit, no software or hardware flow control. USB-CDC adapters
-often ignore the baud setting; both ends still need the same byte framing.
+no parity, 1 stop bit, no software or hardware flow control. The ESP32-C5
+firmware uses UART0 through the board's USB-UART bridge at **921600 baud**;
+the PC must select that rate. The native USB-JTAG connector does not carry
+this firmware's TLV stream.
 
 The link is one bidirectional byte stream. Frames are concatenated with no
 separator, padding, or inter-frame gap. Multi-byte integers and IEEE-754
@@ -21,7 +27,8 @@ binary32 fields are little-endian.
 
 | Direction | Types | Who sends them in this repo |
 |---|---|---|
-| Device → PC | `0x01` SPECTRUM, `0x02` CH_UTIL, `0x03` STATUS | `MockDevice.tick` (demo and `--pty`). `SerialReader` emits these three to the GUI. |
+| Device → PC | `0x03` STATUS | Real firmware: `wifi-monitor/1` JSON events. |
+| Demo → PC | `0x01` SPECTRUM, `0x02` CH_UTIL, `0x03` STATUS | `MockDevice.tick` (demo and `--pty`). `SerialReader` forwards these types to the GUI. |
 | PC → device | `0x10` CONFIG | `MainWindow._send_config` on connect and whenever mode, band, sweep time, FFT size, or sample rate changes. |
 
 The same `TlvParser` accepts all four types on either path. `SerialReader`
@@ -35,16 +42,25 @@ Every frame is:
 ```
 offset  size  field
 0       1     type     u8
-1       2     length   u16 LE   payload size in bytes (the 3-byte header is not included)
+1       2     length   u16 LE   payload size (excludes header and checksum)
 3       length payload
+3+length 4    crc32    u32 LE   CRC over header + payload
 ```
 
-Packed with `struct` format `<BH` plus the payload bytes. `length` may be 0;
-every current payload decoder then fails and the parser resyncs (section 4).
+Packed with `struct` format `<BH`, payload bytes, then `<I` checksum.
+The full frame occupies `length + 7` bytes.
 
 ```
-type u8 | length u16 LE | payload[length]
+type u8 | length u16 LE | payload[length] | crc32 u32 LE
 ```
+
+The checksum is CRC-32/ISO-HDLC, compatible with Python `zlib.crc32`:
+reflected polynomial `0xEDB88320`, initial value and final XOR `0xFFFFFFFF`,
+reflected input/output. It covers the exact three header bytes followed by
+the payload, not the CRC trailer. The standard check is
+`CRC32("123456789") = 0xCBF43926`.
+Both receivers verify the checksum before decoding or applying payload fields.
+There is no CRC-less fallback, sync word or version negotiation.
 
 Known type codes (`KNOWN_TYPES`):
 
@@ -159,8 +175,8 @@ characters) and does this even while playback is paused.
 
 ### 3.4 `0x10` CONFIG (PC → device)
 
-Acquisition settings. The module docstring marks this layout as the proposal
-the PC already sends. Payload is exactly 10 bytes, `<BBHHI`:
+Acquisition settings shared by the GUI, mock and firmware.
+Payload is exactly 10 bytes, `<BBHHI`:
 
 | Offset | Field | Type | Meaning |
 |---|---|---|---|
@@ -195,8 +211,11 @@ not follow those two fields.
 frame. Decode returns a plain dict with keys `mode`, `band`, `sweep_ms`,
 `fft_size`, `sample_rate_khz`.
 
-The PC also shows a resolution bandwidth of `sample_rate_khz / fft_size` kHz.
-That number is computed locally; it is not a wire field.
+Demo shows a resolution bandwidth of `sample_rate_khz / fft_size` kHz.
+Real firmware only validates and echoes the FFT/rate fields; it does not
+produce an FFT, sample raw RF at that rate, or measure an RF bandwidth.
+The real view disables those controls and displays RBW as unavailable.
+See [Wi-Fi monitor events](wifi-monitor.md) for CONFIG application and acknowledgement.
 
 ## 4. Stream parsing and resync
 
@@ -208,9 +227,17 @@ A candidate header is 3 bytes. From a buffer of at least 3 bytes the parser:
 1. Reads `type` and `length`.
 2. If `type` is not one of `0x01`, `0x02`, `0x03`, `0x10`, or `length > 8192`,
    it deletes the first buffer byte, adds 1 to `errors`, and tries again.
-3. If the buffer holds the header but not all `length` payload bytes, it stops
-   and waits for a later `feed` call. It does not drop those bytes.
-4. It decodes the payload. Success consumes `3 + length` bytes and appends the
+   It also rejects impossible type-specific lengths: CONFIG must be 10 bytes,
+   SPECTRUM must be at least 10 with an even number of sample bytes, and
+   CH_UTIL must be at least 2 with an even number of entry bytes.
+3. If the buffer holds the header but not all payload and checksum bytes, it stops
+   and waits for a later `feed` call unless a received fixed prefix already
+   contradicts the length: SPECTRUM declares its sample count in payload bytes
+   8–9; CH_UTIL declares its entry count in payload byte 1.
+   Contradictory prefixes take the one-byte discard path; valid fragments remain buffered.
+4. It verifies CRC32 over the header and payload. A mismatch drops one byte,
+   increments `errors`, and retries without decoding the payload.
+   A valid checksum permits decoding. Success consumes `7 + length` bytes and appends the
    message. `Spectrum`, `ChannelUtil`, and `Status` are objects; CONFIG is a
    `dict`.
 5. Decode failure drops the first byte only, adds 1 to `errors`, and retries.
@@ -222,10 +249,13 @@ can increment it on every slide. `SerialReader` reports `(bytes_received,
 parser.errors)` after each non-empty read; the GUI shows the second value as
 “TLV errors”.
 
-Because a known type with `length ≤ 8192` is held until that many payload
-bytes arrive, a false header inside noise can stall the stream for up to 8192
-payload bytes before step 5 runs. Unknown types and oversized lengths resync
-immediately, one byte at a time.
+An incomplete candidate with a plausible length is retained, so a false header
+inside noise can delay later valid frames until its advertised payload and
+checksum arrive. The residual buffer is bounded by the maximum frame size,
+but recovery has no wall-clock bound when incoming traffic stops.
+CRC protects integrity; it does not remove this framing ambiguity.
+The firmware CONFIG-only parser rejects any header except type `0x10`, length
+`10`, and retains at most 17 bytes.
 
 Concrete decode failures that take the one-byte path:
 
@@ -316,22 +346,20 @@ The sender is not told to stop; STATUS frames are still shown.
 
 These are the limits already called out for this prototype.
 
-- **No sync word and no CRC.** Framing is only `type` + `length` + payload.
-  Resync is the one-byte drop in section 4. That is enough for a clean USB-CDC
-  byte pipe. A sync byte and a CRC16 are the recommended next step before this
-  layout is treated as a firmware contract on a noisy link.
+- **No sync word.** CRC32 is mandatory, but recovery still uses the one-byte
+  drop in section 4. CRC-less peers must be upgraded together with the GUI.
 - **False headers can stall the parser.** A known type with a plausible length
   is buffered until the declared payload arrives. Only then does a decode
   failure drop a single byte.
-- **End of sweep is a frequency heuristic.** The frame has no “last segment” or
-  sweep-id field. The PC uses the comparisons in section 5.
+- **Demo end of sweep is a frequency heuristic.** SPECTRUM has no last-segment
+  field. Real monitoring instead uses explicit `epoch` and `cycle` events.
 - **FFT size and sample rate are placeholders.** They travel in CONFIG, the GUI
   uses them for the on-screen RBW label, and the mock follows them in sweep
-  mode. They do not change the mock’s live-mode bin grid. No firmware consumes
-  them yet.
+  mode. They do not change the mock’s live-mode bin grid. Real firmware
+  validates and echoes them without performing RF FFT acquisition.
 - **Pause is local.** The PC drops SPECTRUM and CH_UTIL while paused. The
   device keeps sending.
-- **5 GHz coverage stops at UNII-3.** The channel list is 36–177 at 20 MHz
+- **Demo 5 GHz coverage stops at UNII-3.** The channel list is 36–177 at 20 MHz
   spacing, including the UNII-2 channels. DFS behavior and 6 GHz are out of
   scope.
 - **Mock traces are synthetic.** The demo generator builds OFDM-like masks,
@@ -349,7 +377,7 @@ Two bins at 2412.0 MHz and 2412.5 MHz, `-54.25 dBm` and `-70.00 dBm`
 (int16 values `-5425` and `-7000`).
 
 ```
-01 0e 00  00 c0 16 45  00 00 00 3f  02 00  cf ea  a8 e4
+01 0e 00  00 c0 16 45  00 00 00 3f  02 00  cf ea  a8 e4  4e 4a 17 6f
 ```
 
 | Bytes | Field |
@@ -361,13 +389,14 @@ Two bins at 2412.0 MHz and 2412.5 MHz, `-54.25 dBm` and `-70.00 dBm`
 | `02 00` | `n` = 2 |
 | `cf ea` | bin 0 = `-5425` → `-54.25 dBm` |
 | `a8 e4` | bin 1 = `-7000` → `-70.00 dBm` |
+| `4e 4a 17 6f` | CRC32 = `0x6F174A4E` |
 
 ### CONFIG
 
 Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s (`sample_rate_khz = 20000`).
 
 ```
-10 0a 00  01  01  e8 03  40 00  20 4e 00 00
+10 0a 00  01  01  e8 03  40 00  20 4e 00 00  95 56 4e 1d
 ```
 
 | Bytes | Field |
@@ -379,6 +408,7 @@ Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s (`sample_rate_khz = 20000`).
 | `e8 03` | `sweep_ms` = 1000 |
 | `40 00` | `fft_size` = 64 |
 | `20 4e 00 00` | `sample_rate_khz` = 20000 |
+| `95 56 4e 1d` | CRC32 = `0x1D4E5695` |
 
-A live 2.4 GHz frame with the same timing and acquisition fields differs only
-in the two id bytes: `10 0a 00 00 00 e8 03 40 00 20 4e 00 00`.
+A live 2.4 GHz frame changes both identifiers and its checksum:
+`10 0a 00 00 00 e8 03 40 00 20 4e 00 00 e8 29 f7 e5`.

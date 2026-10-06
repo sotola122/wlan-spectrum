@@ -1,0 +1,23 @@
+# clangd configuration for the ESP-IDF firmware sources.
+#
+# compile_commands.json (symlinked at the repo root from build/<backend>/)
+# carries the riscv32-esp-elf GCC command line. These GCC-only flags and the
+# newer RISC-V extension names are rejected by clang's driver but are valid
+# for the vendor toolchain, so they are removed for indexing only.
+CompileFlags:
+  Remove:
+    - "-march=*"
+    - "-fno-shrink-wrap"
+    - "-fstrict-volatile-bitfields"
+    - "-fzero-init-padding-bits=all"
+    - "-fno-malloc-dce"
+    - "-fno-jump-tables"
+    - "-fno-tree-switch-conversion"
+    - "-Wno-old-style-declaration"
+    - "-Wno-error=extra"
+    - "-Wno-error=deprecated-declarations"
+    - "-Wno-error=unused-but-set-variable"
+  Add:
+    # Subset of the vendor -march that this clang version understands; the
+    # vendor compiler still uses its own full -march from the build.
+    - "-march=rv32imac_zicsr_zifencei"

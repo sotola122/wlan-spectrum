@@ -1,0 +1,19 @@
+# Host test sources are not part of the firmware compile database; clangd
+# infers flags from a "similar" firmware entry (riscv cross-compile), which
+# cannot parse host files. Strip the inferred cross flags and provide the
+# portable include paths instead. Applies only under tests/.
+If:
+  PathMatch: tests/.*
+CompileFlags:
+  Remove:
+    - "--target=*"
+    - "-march=*"
+    - "-mtune=*"
+    - "-specs=*"
+    - "-I<LOCAL_HOME>/.espressif/*"
+    - "-I*/build/*"
+  Add:
+    - "-std=c11"
+    - "-Ifirmware/main"
+    - "-Ifirmware/managed_components/espressif__cjson/cJSON"
+    - "-Itests/native/fake_sdk"

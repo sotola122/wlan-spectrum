@@ -6,6 +6,7 @@ cards, warm ink text, Cursor Orange only on primary CTAs, mono numerics.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 
@@ -13,14 +14,34 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFormLayout, QFrame, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QMainWindow, QPushButton, QScrollArea, QSlider,
-    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
 
 from . import theme, tlv
-from .bands import BAND_24, BAND_5, BANDS, channel_freq
+from .bands import BAND_5, BAND_24, BANDS, channel_freq
 from .mock import MODE_LIVE, MODE_SWEEP, MockSource
+from .monitor_data import SCHEMA as MONITOR_SCHEMA
+from .monitor_data import MonitorState
+from .monitor_widget import DISCONNECTED_TEXT, WAITING_TEXT, MonitorWidget
 from .serial_link import SerialReader, available_ports
 from .theme import C
 
@@ -49,7 +70,7 @@ class Segmented(QFrame):
             b = QPushButton(text)
             b.setObjectName("seg")
             b.setCheckable(True)
-            b.setCursor(Qt.PointingHandCursor)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
             self._group.addButton(b, i)
             lay.addWidget(b)
         self._group.button(0).setChecked(True)
@@ -59,9 +80,6 @@ class Segmented(QFrame):
 
     def currentIndex(self) -> int:
         return self._idx
-
-    def button(self, i: int) -> QPushButton:
-        return self._group.button(i)
 
     def setCurrentIndex(self, i: int) -> None:
         self._group.button(i).setChecked(True)
@@ -92,7 +110,7 @@ def _labeled(text: str, w: QWidget) -> QWidget:
 def _value(text: str = "-") -> QLabel:
     lab = QLabel(text)
     lab.setObjectName("value")
-    lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     return lab
 
 
@@ -122,9 +140,9 @@ class PlotCard(QFrame):
         head.addStretch(1)
         self.head = head
         lay.addLayout(head)
-        self.view = pg.PlotWidget()
-        self.view.setFrameShape(QFrame.NoFrame)
-        self.plot: pg.PlotItem = self.view.getPlotItem()
+        self.plot = pg.PlotItem()
+        self.view = pg.PlotWidget(plotItem=self.plot)
+        self.view.setFrameShape(QFrame.Shape.NoFrame)
         theme.style_plot(self.plot)
         lay.addWidget(self.view, 1)
 
@@ -140,6 +158,7 @@ class MainWindow(QMainWindow):
         self.resize(1480, 940)
 
         self.source = None              # SerialReader | MockSource | None
+        self.monitor_state = MonitorState()
         self.mode = MODE_LIVE
         self.band = BAND_24
         self.playing = False
@@ -157,7 +176,7 @@ class MainWindow(QMainWindow):
         body = QHBoxLayout()
         body.setContentsMargins(20, 20, 20, 16)
         body.setSpacing(20)
-        body.addWidget(self._build_plots(), 1)
+        body.addWidget(self._build_stack(), 1)
         body.addWidget(self._build_right_panel())
         root.addLayout(body, 1)
         self.setCentralWidget(central)
@@ -239,7 +258,7 @@ class MainWindow(QMainWindow):
         self.port_combo = QComboBox()
         self.port_combo.setFixedWidth(124)
         self.port_combo.setEditable(True)        # COM3, /dev/ttyUSB0, or a Linux pty path
-        self.port_combo.lineEdit().setPlaceholderText("COM port")
+        self.port_combo.setPlaceholderText("COM port")
         self.port_combo.setToolTip("Serial port (Windows: COM3; Linux: /dev/ttyUSB0 or /dev/ttyACM0)")
         lay.addWidget(self.port_combo)
         refresh = QPushButton("⟳")
@@ -262,6 +281,19 @@ class MainWindow(QMainWindow):
         return bar
 
     # ============================================================ plots
+    def _build_stack(self) -> QWidget:
+        """Demo plots and the real-device monitor view share one stack.
+
+        The initial view is the existing plot stack; a serial source switches
+        to the monitor view immediately, a legacy device falls back only when
+        actual Spectrum/ChannelUtil frames arrive.
+        """
+        self.monitor_widget = MonitorWidget(self.monitor_state)
+        self.plot_stack = QStackedWidget()
+        self.plot_stack.addWidget(self._build_plots())
+        self.plot_stack.addWidget(self.monitor_widget)
+        return self.plot_stack
+
     def _build_plots(self) -> QWidget:
         box = QWidget()
         lay = QVBoxLayout(box)
@@ -278,11 +310,11 @@ class MainWindow(QMainWindow):
         self.peak_legend = _legend_chip(theme.PEAK_LINE, "Peak Hold")
         self.spec_card.add_header_widget(self.peak_legend)
         theme.axis_label(sp, "left", "dBm")
-        sp.setMouseEnabled(x=True, y=False)
+        sp.getViewBox().setMouseEnabled(x=True, y=False)
         self.peak_curve = sp.plot(pen=pg.mkPen(theme.PEAK_LINE, width=1.2))
         self.cur_curve = sp.plot(pen=pg.mkPen(theme.SPECTRUM_LINE, width=1.6),
                                  fillLevel=-200, brush=pg.mkBrush(*theme.SPECTRUM_FILL))
-        self.vline = pg.InfiniteLine(angle=90, pen=pg.mkPen(C["muted_soft"], style=Qt.DashLine))
+        self.vline = pg.InfiniteLine(angle=90, pen=pg.mkPen(C["muted_soft"], style=Qt.PenStyle.DashLine))
         sp.addItem(self.vline, ignoreBounds=True)
         sp.scene().sigMouseMoved.connect(self._on_mouse_moved)
         lay.addWidget(self.spec_card, 4)
@@ -291,12 +323,15 @@ class MainWindow(QMainWindow):
         self.wf_card = PlotCard("Waterfall", "TIME × FREQUENCY")
         wp = self.wf_plot = self.wf_card.plot
         theme.axis_label(wp, "left", "Frames")
-        wp.invertY(True)                         # newest row at the top
-        wp.setMouseEnabled(x=True, y=False)
+        wp.getViewBox().invertY(True)               # newest row at the top
+        wp.getViewBox().setMouseEnabled(x=True, y=False)
         wp.showGrid(x=False, y=False)
-        wp.setXLink(sp)
+        wp.getViewBox().setXLink(sp.getViewBox())
         self.wf_img = pg.ImageItem()
-        self.wf_img.setLookupTable(theme.waterfall_cmap().getLookupTable(nPts=256))
+        lut = theme.waterfall_cmap().getLookupTable(nPts=256)
+        if not isinstance(lut, np.ndarray):
+            raise RuntimeError("waterfall LUT did not interpolate to an array")
+        self.wf_img.setLookupTable(lut)
         wp.addItem(self.wf_img)
         lay.addWidget(self.wf_card, 4)
 
@@ -307,10 +342,10 @@ class MainWindow(QMainWindow):
         up = self.util_plot = self.util_card.plot
         theme.axis_label(up, "left", "%")
         theme.axis_label(up, "bottom", "Channel")
-        up.setYRange(0, 105, padding=0)
-        up.setMouseEnabled(x=True, y=False)
+        up.getViewBox().setYRange(0, 105, padding=0)
+        up.getViewBox().setMouseEnabled(x=True, y=False)
         up.showGrid(x=False, y=True, alpha=0.12)
-        up.setXLink(sp)
+        up.getViewBox().setXLink(sp.getViewBox())
         self.util_bars = pg.BarGraphItem(x=[], height=[], width=1)
         up.addItem(self.util_bars)
         self.util_texts: list[pg.TextItem] = []
@@ -327,18 +362,19 @@ class MainWindow(QMainWindow):
 
         # channel list
         g = QGroupBox("CHANNELS")
+        self.channel_group = g
         gl = QVBoxLayout(g)
         gl.setSpacing(10)
         self.ch_table = QTableWidget(0, 4)
         self.ch_table.setHorizontalHeaderLabels(["CH", "MHz", "Util", "Peak"])
         self.ch_table.verticalHeader().setVisible(False)
         self.ch_table.verticalHeader().setDefaultSectionSize(26)
-        self.ch_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ch_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.ch_table.setShowGrid(False)
-        self.ch_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.ch_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ch_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.ch_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.ch_table.setAlternatingRowColors(True)
-        self.ch_table.setFocusPolicy(Qt.NoFocus)
+        self.ch_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.ch_table.setMinimumHeight(200)
         self.ch_table.setFont(theme.mono_font(9))
         self.ch_table.cellClicked.connect(self._zoom_to_channel)
@@ -381,6 +417,7 @@ class MainWindow(QMainWindow):
         vl.addSpacing(4)
         reset = QPushButton("Reset Peak")
         reset.clicked.connect(self._reset_peak)
+        self.peak_reset_btn = reset
         vl.addWidget(reset)
         lay.addWidget(g)
 
@@ -388,10 +425,10 @@ class MainWindow(QMainWindow):
         g = QGroupBox("dB RANGE")
         fl = QFormLayout(g)
         fl.setVerticalSpacing(12)
-        self.db_max = QSlider(Qt.Horizontal)
+        self.db_max = QSlider(Qt.Orientation.Horizontal)
         self.db_max.setRange(-70, 0)
         self.db_max.setValue(-20)
-        self.db_min = QSlider(Qt.Horizontal)
+        self.db_min = QSlider(Qt.Orientation.Horizontal)
         self.db_min.setRange(-130, -60)
         self.db_min.setValue(-105)
         self.db_max_lbl, self.db_min_lbl = _value(), _value()
@@ -400,7 +437,7 @@ class MainWindow(QMainWindow):
             row.setSpacing(10)
             row.addWidget(s, 1)
             lab.setMinimumWidth(72)
-            lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lab.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             row.addWidget(lab)
             fl.addRow(name, row)
             s.valueChanged.connect(self._apply_db_range)
@@ -432,9 +469,9 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()                   # keeps the panel usable on small screens
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setFixedWidth(330)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         return scroll
 
     def _set_conn(self, text: str, state: str = "") -> None:
@@ -460,8 +497,8 @@ class MainWindow(QMainWindow):
         self._update_sweep_label()
 
         for p in (self.spec_plot, self.wf_plot, self.util_plot):
-            p.setLimits(xMin=info.f_start, xMax=info.f_stop)
-        self.wf_plot.setYRange(0, WATERFALL_ROWS, padding=0)
+            p.getViewBox().setLimits(xMin=info.f_start, xMax=info.f_stop)
+        self.wf_plot.getViewBox().setYRange(0, WATERFALL_ROWS, padding=0)
         self._reset_x()
 
         # channel markers on the spectrum + channel ticks on the bar axis
@@ -472,8 +509,8 @@ class MainWindow(QMainWindow):
         for ch in info.channels:
             f = channel_freq(band, ch)
             ln = pg.InfiniteLine(
-                f, angle=90, pen=pg.mkPen(C["hairline"], style=Qt.DotLine), label=str(ch),
-                labelOpts=dict(position=0.97, color=C["muted"], anchors=[(0.5, 0), (0.5, 0)]))
+                f, angle=90, pen=pg.mkPen(C["hairline"], style=Qt.PenStyle.DotLine), label=str(ch),
+                labelOpts={"position": 0.97, "color": C["muted"], "anchors": [(0.5, 0), (0.5, 0)]})
             ln.label.setFont(theme.mono_font(7.5))
             ln.setVisible(self.ch_chk.isChecked())
             self.spec_plot.addItem(ln, ignoreBounds=True)
@@ -490,32 +527,81 @@ class MainWindow(QMainWindow):
         for r, ch in enumerate(info.channels):
             for c, txt in enumerate((str(ch), f"{channel_freq(band, ch):.0f}", "—", "—")):
                 it = QTableWidgetItem(txt)
-                it.setTextAlignment(Qt.AlignCenter)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.ch_table.setItem(r, c, it)
         self._update_util_bars()
+        if self._real_monitor():
+            self._reset_monitor("Waiting for configuration")
         self._send_config()
         self._dirty = True
 
     def _on_mode_changed(self, idx: int) -> None:
         self.mode = MODE_SWEEP if idx == 1 else MODE_LIVE
-        sweep = self.mode == MODE_SWEEP
-        self.sweep_time.setEnabled(sweep)
-        self.sweep_count.setEnabled(sweep)
         self.sweeps_done = 0
         self._update_sweep_label()
+        self._update_timing_controls()
+        if self._real_monitor():
+            self._reset_monitor("Waiting for configuration")
         self._send_config()
 
     def _reset_x(self) -> None:
         info = BANDS[self.band]
-        self.spec_plot.setXRange(info.f_start, info.f_stop, padding=0)
+        self.spec_plot.getViewBox().setXRange(info.f_start, info.f_stop, padding=0)
 
     def _zoom_to_channel(self, row: int, _col: int) -> None:
         ch = BANDS[self.band].channels[row]
         f = channel_freq(self.band, ch)
         half = 30 if self.band == BAND_24 else 60
-        self.spec_plot.setXRange(f - half, f + half, padding=0)
+        self.spec_plot.getViewBox().setXRange(f - half, f + half, padding=0)
 
     # ============================================================ sources
+    def _real_monitor(self) -> bool:
+        """True while the real-device monitor view is active. A legacy serial
+        device that falls back to the demo plots is not a real monitor view,
+        so its provisional FFT/RBW controls behave like Demo again."""
+        return self.plot_stack.currentIndex() == 1
+
+    def _enter_real_view(self) -> None:
+        self._reset_monitor()
+        self.plot_stack.setCurrentIndex(1)
+        self._apply_real_controls(True)
+
+    def _exit_real_view(self) -> None:
+        self.plot_stack.setCurrentIndex(0)
+        self._apply_real_controls(False)
+
+    def _legacy_fallback(self) -> None:
+        """Old serial firmware without wifi-monitor/1: show the original
+        plots, but only when real Spectrum/ChannelUtil frames arrive."""
+        if self.plot_stack.currentIndex() == 0:
+            return
+        self.plot_stack.setCurrentIndex(0)
+        self._apply_real_controls(False)
+        self.statusBar().showMessage(
+            "Device streams legacy spectrum frames; showing standard plots")
+
+    def _apply_real_controls(self, real: bool) -> None:
+        # FFT/sample-rate/RBW and the peak/waterfall toggles describe the
+        # mock RF model; real monitoring measures neither, so they are
+        # disabled instead of showing invented values. Demo restores them.
+        self.fft_combo.setEnabled(not real)
+        self.sr_combo.setEnabled(not real)
+        self.peak_chk.setEnabled(not real)
+        self.wf_chk.setEnabled(not real)
+        self.peak_reset_btn.setEnabled(not real)
+        self.channel_group.setVisible(not real)
+        self._update_timing_controls()
+        self._update_rbw()
+
+    def _update_timing_controls(self) -> None:
+        # Real mode: sweep time is the hopping interval in Live as well.
+        self.sweep_time.setEnabled(self._real_monitor() or self.mode == MODE_SWEEP)
+        self.sweep_count.setEnabled(self.mode == MODE_SWEEP)
+
+    def _reset_monitor(self, message: str = WAITING_TEXT) -> None:
+        self.monitor_state.reset()
+        self.monitor_widget.set_waiting(message)
+
     def _refresh_ports(self) -> None:
         cur = self.port_combo.currentText()
         self.port_combo.clear()
@@ -530,7 +616,14 @@ class MainWindow(QMainWindow):
         src.error.connect(self._on_source_error)
         src.stats.connect(self._on_stats)
         self.source = src
-        self._send_config()
+        if isinstance(src, SerialReader):
+            # The initial CONFIG must wait until the port is actually open;
+            # a write before open is silently dropped (no timer workarounds).
+            src.opened.connect(self._send_config)
+            self._enter_real_view()
+        else:
+            self._exit_real_view()
+            self._send_config()            # MockSource writes immediately
 
     def _detach(self) -> None:
         if self.source is not None:
@@ -539,12 +632,14 @@ class MainWindow(QMainWindow):
             for sig, slot in ((src.spectrum, self._on_spectrum), (src.ch_util, self._on_util),
                               (src.status, self._on_status), (src.error, self._on_source_error),
                               (src.stats, self._on_stats)):
-                try:
+                with contextlib.suppress(RuntimeError, TypeError):
                     sig.disconnect(slot)
-                except (RuntimeError, TypeError):
-                    pass
+            if isinstance(src, SerialReader):
+                with contextlib.suppress(RuntimeError, TypeError):
+                    src.opened.disconnect(self._send_config)
             src.deleteLater()
         self._set_conn("Disconnected")
+        self._reset_monitor(DISCONNECTED_TEXT)
 
     def _on_demo_toggled(self, on: bool) -> None:
         if on:
@@ -598,9 +693,13 @@ class MainWindow(QMainWindow):
         self._update_rbw()
         if self.source is None:
             return
-        sr_khz = int(self.sr_combo.currentText().split()[0]) * 1000
-        self.source.write(tlv.encode_config(self.mode, self.band, self.sweep_time.value(),
-                                            int(self.fft_combo.currentText()), sr_khz))
+        fields = (self.mode, self.band, self.sweep_time.value(),
+                  int(self.fft_combo.currentText()),
+                  int(self.sr_combo.currentText().split()[0]) * 1000)
+        if self._real_monitor():
+            # an echo of these five fields is the device's acknowledgement
+            self.monitor_state.request(*fields)
+        self.source.write(tlv.encode_config(*fields))
 
     def _on_play_toggled(self, on: bool) -> None:
         self.playing = on
@@ -612,6 +711,8 @@ class MainWindow(QMainWindow):
 
     # ============================================================ data in
     def _on_spectrum(self, msg: tlv.Spectrum) -> None:
+        if self._real_monitor():
+            self._legacy_fallback()
         if not self.playing or len(msg.dbm) < 2:
             return
         f = msg.freqs
@@ -641,13 +742,44 @@ class MainWindow(QMainWindow):
         self.wf[0] = self.cur
 
     def _on_util(self, msg: tlv.ChannelUtil) -> None:
+        if self._real_monitor():
+            self._legacy_fallback()
         if msg.band != self.band or not self.playing:
             return
         self._util = dict(msg.util)
         self._update_util_bars()
 
     def _on_status(self, msg: tlv.Status) -> None:
-        self.dev_lbl.setText(json.dumps(msg.data, ensure_ascii=False)[:200])
+        data = msg.data
+        if isinstance(data, dict) and data.get("schema") == MONITOR_SCHEMA:
+            self._on_monitor_status(data)
+            return
+        self.dev_lbl.setText(json.dumps(data, ensure_ascii=False)[:200])
+
+    def _on_monitor_status(self, data: dict) -> None:
+        event = data.get("event")
+        if event in ("channel", "cycle") and not self.playing:
+            return          # paused: measurements are gated before acceptance;
+                            # config/error status still processes while paused
+        try:
+            changed = self.monitor_state.accept(data)
+        except ValueError as exc:
+            self.statusBar().showMessage(f"Rejected monitor payload: {exc}")
+            return
+        if not changed:
+            return
+        self.monitor_widget.refresh()
+        if event == "config":
+            self.dev_lbl.setText(
+                f"{data.get('fw', '?')} · {data.get('chip', '?')} · "
+                f"{data.get('country', '?')} · epoch {data.get('epoch')}")
+        elif event == "cycle" and self.playing and self.mode == MODE_SWEEP:
+            self.sweeps_done += 1
+            self._update_sweep_label()
+            limit = self.sweep_count.value()
+            if limit and self.sweeps_done >= limit:
+                self.play_btn.setChecked(False)
+                self.statusBar().showMessage(f"Completed {limit} sweeps")
 
     def _on_stats(self, rx: int, errors: int) -> None:
         self.rx_lbl.setText(f"{rx / 1024:.1f} KiB" if rx > 1024 else f"{rx} B")
@@ -685,7 +817,7 @@ class MainWindow(QMainWindow):
         self.util_texts = []
         if self._util:
             font = theme.mono_font(7.5)
-            for x, h in zip(xs, hs):
+            for x, h in zip(xs, hs, strict=True):
                 t = pg.TextItem(f"{h}", color=C["body"], anchor=(0.5, 1))
                 t.setFont(font)
                 t.setPos(x, h)
@@ -710,11 +842,14 @@ class MainWindow(QMainWindow):
         lo, hi = self.db_min.value(), self.db_max.value()
         self.db_min_lbl.setText(f"{lo} dBm")
         self.db_max_lbl.setText(f"{hi} dBm")
-        self.spec_plot.setYRange(lo, hi, padding=0)
+        self.spec_plot.getViewBox().setYRange(lo, hi, padding=0)
         self.wf_img.setLevels((lo, hi))
         self._dirty = True
 
     def _update_rbw(self) -> None:
+        if self._real_monitor():
+            self.rbw_lbl.setText("N/A — no RF FFT")
+            return
         sr = int(self.sr_combo.currentText().split()[0])
         fft = int(self.fft_combo.currentText())
         self.rbw_lbl.setText(f"{sr * 1000 / fft:.1f} kHz")
@@ -736,7 +871,7 @@ class MainWindow(QMainWindow):
         self.util_card.setVisible(on)
 
     def _on_mouse_moved(self, pos) -> None:
-        vb = self.spec_plot.vb
+        vb = self.spec_plot.getViewBox()
         if not vb.sceneBoundingRect().contains(pos):
             self.readout.setText("")
             return

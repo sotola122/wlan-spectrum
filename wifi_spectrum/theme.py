@@ -11,14 +11,16 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import QApplication
 
 # ---- design tokens (DESIGN.md › colors) --------------------------------
-C = dict(
-    primary="#f54e00", primary_active="#d04200", on_primary="#ffffff",
-    ink="#26251e", body="#5a5852", muted="#807d72", muted_soft="#a09c92",
-    hairline="#e6e5e0", hairline_soft="#efeee8", hairline_strong="#cfcdc4",
-    canvas="#f7f7f4", canvas_soft="#fafaf7", card="#ffffff", surface_strong="#e6e5e0",
-    peach="#dfa88f", mint="#9fc9a2", blue="#9fbbe0", lavender="#c0a8dd", gold="#c08532",
-    error="#cf2d56", success="#1f8a65",
-)
+C = {
+    "primary": "#f54e00", "primary_active": "#d04200", "on_primary": "#ffffff",
+    "ink": "#26251e", "body": "#5a5852", "muted": "#807d72", "muted_soft": "#a09c92",
+    "hairline": "#e6e5e0", "hairline_soft": "#efeee8", "hairline_strong": "#cfcdc4",
+    "canvas": "#f7f7f4", "canvas_soft": "#fafaf7", "card": "#ffffff",
+    "surface_strong": "#e6e5e0",
+    "peach": "#dfa88f", "mint": "#9fc9a2", "blue": "#9fbbe0",
+    "lavender": "#c0a8dd", "gold": "#c08532",
+    "error": "#cf2d56", "success": "#1f8a65",
+}
 
 # Plot accents (pastels are allowed here as data colours)
 SPECTRUM_LINE = "#3f6fae"       # deeper "read" blue for contrast on white
@@ -38,7 +40,7 @@ def _css_families(fams: list[str]) -> str:
     return ", ".join(f'"{f}"' if " " in f else f for f in fams)
 
 
-def ui_font(pt: float = 10, weight: QFont.Weight = QFont.Normal) -> QFont:
+def ui_font(pt: float = 10, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
     f = QFont()
     f.setFamilies(UI_FAMILIES)
     f.setPointSizeF(pt)
@@ -50,7 +52,7 @@ def mono_font(pt: float = 9) -> QFont:
     f = QFont()
     f.setFamilies(MONO_FAMILIES)
     f.setPointSizeF(pt)
-    f.setStyleHint(QFont.Monospace)
+    f.setStyleHint(QFont.StyleHint.Monospace)
     return f
 
 
@@ -96,16 +98,19 @@ def apply_theme(app: QApplication) -> None:
 
     p = QPalette()
     for role, col in [
-        (QPalette.Window, C["canvas"]), (QPalette.WindowText, C["ink"]),
-        (QPalette.Base, C["card"]), (QPalette.AlternateBase, C["canvas_soft"]),
-        (QPalette.Text, C["ink"]), (QPalette.Button, C["card"]), (QPalette.ButtonText, C["ink"]),
-        (QPalette.ToolTipBase, C["card"]), (QPalette.ToolTipText, C["ink"]),
-        (QPalette.Highlight, C["surface_strong"]), (QPalette.HighlightedText, C["ink"]),
-        (QPalette.PlaceholderText, C["muted_soft"]),
+        (QPalette.ColorRole.Window, C["canvas"]), (QPalette.ColorRole.WindowText, C["ink"]),
+        (QPalette.ColorRole.Base, C["card"]), (QPalette.ColorRole.AlternateBase, C["canvas_soft"]),
+        (QPalette.ColorRole.Text, C["ink"]), (QPalette.ColorRole.Button, C["card"]),
+        (QPalette.ColorRole.ButtonText, C["ink"]),
+        (QPalette.ColorRole.ToolTipBase, C["card"]), (QPalette.ColorRole.ToolTipText, C["ink"]),
+        (QPalette.ColorRole.Highlight, C["surface_strong"]),
+        (QPalette.ColorRole.HighlightedText, C["ink"]),
+        (QPalette.ColorRole.PlaceholderText, C["muted_soft"]),
     ]:
         p.setColor(role, QColor(col))
-    for role in (QPalette.Text, QPalette.ButtonText, QPalette.WindowText):
-        p.setColor(QPalette.Disabled, role, QColor(C["muted_soft"]))
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText,
+                 QPalette.ColorRole.WindowText):
+        p.setColor(QPalette.ColorGroup.Disabled, role, QColor(C["muted_soft"]))
     app.setPalette(p)
     app.setStyleSheet(stylesheet())
 

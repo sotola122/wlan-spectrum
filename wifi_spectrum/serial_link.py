@@ -6,8 +6,8 @@ import re
 import threading
 
 import serial
-from serial.tools import list_ports
 from PySide6.QtCore import QThread, Signal
+from serial.tools import list_ports
 
 from .tlv import ChannelUtil, Spectrum, Status, TlvParser
 
@@ -32,6 +32,8 @@ class SerialReader(QThread):
     """Reads the serial port in its own thread and emits decoded messages.
 
     Signals are delivered to the GUI thread through Qt's queued connections.
+    ``opened`` fires exactly once, after the port is successfully open and
+    before any read, so callers can transmit their first frame safely.
     """
 
     spectrum = Signal(object)       # tlv.Spectrum
@@ -39,6 +41,7 @@ class SerialReader(QThread):
     status = Signal(object)         # tlv.Status
     error = Signal(str)
     stats = Signal(int, int)        # bytes received, parse errors
+    opened = Signal()               # port is open; first write is safe
 
     def __init__(self, port: str, baud: int = 921600, parent=None) -> None:
         super().__init__(parent)
@@ -54,6 +57,7 @@ class SerialReader(QThread):
         except (serial.SerialException, OSError) as e:
             self.error.emit(f"Cannot open port: {e}")
             return
+        self.opened.emit()                  # before any read/write attempt
         try:
             while not self._stop.is_set():
                 chunk = self._ser.read(self._ser.in_waiting or 1)
