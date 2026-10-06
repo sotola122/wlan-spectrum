@@ -1,0 +1,80 @@
+"""USB-UART link: background reader thread that parses TLV frames."""
+
+from __future__ import annotations
+
+import threading
+
+import serial
+from serial.tools import list_ports
+from PySide6.QtCore import QThread, Signal
+
+from .tlv import ChannelUtil, Spectrum, Status, TlvParser
+
+
+def available_ports() -> list[str]:
+    """Serial port device names (COMx on Windows, /dev/ttyUSB*/ttyACM* on Linux)."""
+    return [p.device for p in sorted(list_ports.comports(), key=lambda p: p.device)]
+
+
+class SerialReader(QThread):
+    """Reads the serial port in its own thread and emits decoded messages.
+
+    Signals are delivered to the GUI thread through Qt's queued connections.
+    """
+
+    spectrum = Signal(object)       # tlv.Spectrum
+    ch_util = Signal(object)        # tlv.ChannelUtil
+    status = Signal(object)         # tlv.Status
+    error = Signal(str)
+    stats = Signal(int, int)        # bytes received, parse errors
+
+    def __init__(self, port: str, baud: int = 921600, parent=None) -> None:
+        super().__init__(parent)
+        self.port, self.baud = port, baud
+        self._stop = threading.Event()
+        self._ser: serial.Serial | None = None
+        self._lock = threading.Lock()
+
+    def run(self) -> None:
+        parser, rx = TlvParser(), 0
+        try:
+            self._ser = serial.Serial(self.port, self.baud, timeout=0.05)
+        except (serial.SerialException, OSError) as e:
+            self.error.emit(f"Cannot open port: {e}")
+            return
+        try:
+            while not self._stop.is_set():
+                chunk = self._ser.read(self._ser.in_waiting or 1)
+                if not chunk:
+                    continue
+                rx += len(chunk)
+                for msg in parser.feed(chunk):
+                    self._dispatch(msg)
+                self.stats.emit(rx, parser.errors)
+        except (serial.SerialException, OSError) as e:
+            self.error.emit(f"Serial error: {e}")
+        finally:
+            with self._lock:
+                self._ser.close()
+                self._ser = None
+
+    def _dispatch(self, msg) -> None:
+        if isinstance(msg, Spectrum):
+            self.spectrum.emit(msg)
+        elif isinstance(msg, ChannelUtil):
+            self.ch_util.emit(msg)
+        elif isinstance(msg, Status):
+            self.status.emit(msg)
+
+    def write(self, data: bytes) -> None:
+        """Send bytes to the device (e.g. a CONFIG frame). Safe from GUI thread."""
+        with self._lock:
+            if self._ser is not None and self._ser.is_open:
+                try:
+                    self._ser.write(data)
+                except (serial.SerialException, OSError) as e:
+                    self.error.emit(f"Send error: {e}")
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.wait(1000)
