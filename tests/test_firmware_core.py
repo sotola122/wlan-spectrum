@@ -7,6 +7,7 @@ Wire scenarios emit real TLV bytes decoded by wifi_spectrum.tlv.TlvParser.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import unittest
@@ -324,6 +325,11 @@ class AppMainApplyAckTests(unittest.TestCase):
                     proc.returncode, 0,
                     f"apply site {site}: rc={proc.returncode}\n"
                     f"{proc.stdout}\n{proc.stderr}")
+                if site == "1":
+                    self.assertIn("site1 dwell-tick-schedule ok",
+                                  proc.stdout)
+                else:
+                    self.assertIn("site2 backoff-no-ticks ok", proc.stdout)
 
     def test_negative_control_detects_missing_apply_ack(self) -> None:
         # Strip BOTH apply-site acks from a scratch copy; the same fixture
@@ -416,6 +422,57 @@ class AdapterSeamTests(unittest.TestCase):
         # keys, truthful gap when invalid, no arm on failed begin
         _run(self.exe, "radio-util")
 
+    def test_radio_util_pooled_8slot(self) -> None:
+        # CURRENT contract: 8 distributed windows pooled into samples /
+        # attempted / busy / total / window_us_upper; strict count bounds;
+        # NO version key anywhere (wifi-monitor/1 outer schema only).
+        # The fixture prints TWO pooled JSONs: the constant 8-window dwell,
+        # then a MIXED dwell (valid/invalid/valid -> samples2 attempted3).
+        out = _run(self.exe, "radio-util-pooled").decode()
+        self.assertIn("radio-util-pooled ok", out)
+        events = [json.loads(ln) for ln in out.splitlines()
+                  if ln.startswith("{")]
+        self.assertEqual(len(events), 2, "expected 8-window + mixed JSON")
+
+        event = events[0]
+        self.assertEqual(event["event"], "channel")
+        util = event["util"]
+        self.assertNotIn("version", util)
+        self.assertNotIn("version", event)
+        self.assertEqual(util["source"], "c5_v6.0.3_phy_cca_cnt")
+        self.assertEqual(util["confidence"], "experimental_sampled")
+        self.assertEqual(util["samples"], 8)
+        self.assertEqual(util["attempted"], 8)
+        self.assertEqual(util["total"], 8 * 0x400)
+        # constant fake trace: A saturates 0->0x400 in 13 reads, B +40 per
+        # read (520/window), identical windows -> pooled busy 8 x 520
+        self.assertEqual(util["busy"], 8 * 520)
+        # pooled count bounds (host-frozen contract)
+        self.assertGreaterEqual(util["samples"], 1)
+        self.assertGreaterEqual(util["attempted"], util["samples"])
+        self.assertLessEqual(util["attempted"], 8)
+        self.assertGreaterEqual(util["total"], util["samples"])
+        self.assertLessEqual(util["total"], util["samples"] * 0x07FFFFFF)
+        self.assertLessEqual(util["busy"], util["total"])
+        self.assertGreaterEqual(util["window_us_upper"], util["samples"])
+        self.assertLessEqual(util["window_us_upper"],
+                             5000 * util["samples"])
+
+        # mixed dwell: valid/invalid/valid -> only valid windows pooled
+        mixed = events[1]["util"]
+        self.assertNotIn("version", mixed)
+        self.assertEqual(mixed["samples"], 2)
+        self.assertEqual(mixed["attempted"], 3)
+        self.assertEqual(mixed["total"], 2 * 0x400)
+        self.assertEqual(mixed["busy"], 520 + 520)
+        self.assertGreaterEqual(mixed["samples"], 1)
+        self.assertGreaterEqual(mixed["attempted"], mixed["samples"])
+        self.assertLessEqual(mixed["attempted"], 8)
+        self.assertLessEqual(mixed["busy"], mixed["total"])
+        self.assertGreaterEqual(mixed["window_us_upper"], mixed["samples"])
+        self.assertLessEqual(mixed["window_us_upper"],
+                             5000 * mixed["samples"])
+
     def test_tx_task_frame_not_on_task_stack(self) -> None:
         # A 4103-byte MonitorTlvFrame local would exceed the 4096-byte TX
         # task stack (and nested wasting the app task's stack) before any
@@ -502,7 +559,9 @@ class SpectrumWireTests(unittest.TestCase):
         return (i10 | (q10 << 10)).astype("<u4")
 
     @staticmethod
-    def _reference_bins(words: np.ndarray) -> np.ndarray:
+    def _reference_bins_noremove(words: np.ndarray) -> np.ndarray:
+        """Pre-correction convention (kept ONLY to prove non-DC tones are
+        unchanged by the mean removal)."""
         n = len(words)
         w = words.astype(np.uint32)
         i = (w & 0x3FF).astype(np.int64)
@@ -510,6 +569,27 @@ class SpectrumWireTests(unittest.TestCase):
         q = ((w >> 10) & 0x3FF).astype(np.int64)
         q = np.where(q & 0x200, q - 0x400, q)
         x = (i + 1j * q) / 512.0
+        nn = np.arange(n)
+        hann = 0.5 * (1.0 - np.cos(2 * np.pi * nn / n))
+        X = np.fft.fft(x * hann)
+        W = hann.sum()
+        P = np.abs(X) ** 2 / (W * W)
+        dbfs = 10.0 * np.log10(np.maximum(P, 1.0e-30))
+        idx = (np.arange(n) + n // 2) % n          # frozen fftshift order
+        shifted = dbfs[idx]
+        return np.clip(np.round(shifted * 100.0), -32768, 32767)
+
+    @staticmethod
+    def _reference_bins(words: np.ndarray) -> np.ndarray:
+        n = len(words)
+        w = words.astype(np.uint32)
+        i = (w & 0x3FF).astype(np.int64)
+        i = np.where(i & 0x200, i - 0x400, i)
+        q = ((w >> 10) & 0x3FF).astype(np.int64)
+        q = np.where(q & 0x200, q - 0x400, q)
+        # Production contract: per-capture mean I/Q removed BEFORE Hann.
+        # (f32 is exact here: integer sums / power-of-two sizes.)
+        x = ((i - i.mean()) + 1j * (q - q.mean())) / 512.0
         nn = np.arange(n)
         hann = 0.5 * (1.0 - np.cos(2 * np.pi * nn / n))
         X = np.fft.fft(x * hann)
@@ -558,19 +638,63 @@ class SpectrumWireTests(unittest.TestCase):
                 # No fabricated energy above the reference peak anywhere.
                 self.assertLessEqual(int(np.max(got)), peak_want + 50,
                                      f"{name}: bin above reference peak")
-                if name != "half":
+                if name != "half" and name != "dc":
                     expect_k = (k0 - n // 2) % n
                     self.assertEqual(int(np.argmax(got)), expect_k,
                                      f"{name}: fftshift peak misplaced")
                 peak_dbfs[name] = int(np.max(got))
+                if name == "dc":
+                    # Mean removal collapses a pure DC capture to the
+                    # POWER_FLOOR: every bin at -300 dB, never 0 dBFS.
+                    self.assertLessEqual(int(np.max(got)), -29900,
+                                         f"dc: not at floor: {int(np.max(got))}")
+                    self.assertGreater(int(np.min(got)), -32768,
+                                       "dc: floor underflow")
+                    continue
                 # Peak magnitude itself must hit the float64 reference.
                 self.assertLessEqual(
                     abs(int(np.max(got)) - int(np.max(want))), 3,
                     f"{name}: peak power off")
+                # Non-DC tones are UNCHANGED vs the pre-correction
+                # convention: the removal is a no-op away from centre.
+                noremove = self._reference_bins_noremove(words)
+                unchanged = np.abs(got - noremove)[mask]
+                self.assertLessEqual(
+                    int(np.max(unchanged)), 30,
+                    f"{name}: non-DC tone changed by DC correction: "
+                    f"{int(np.max(unchanged))} centi-dB")
         # complex-tone amplitude law: -6.02 dB at half amplitude
         delta = peak_dbfs["half"] - peak_dbfs["pos"]
         self.assertLessEqual(abs(delta - (-602)), 8,
                              f"half-vs-full peak delta {delta} centi-dB")
+
+    def test_tone_with_dc_offset_collapses_center_only(self) -> None:
+        """bin-centre tone + DC offset: mean removal collapses the offset
+        out of the centre bin while the tone lobe stays put."""
+        n, k0, amp, dc = 64, 5, 511, 150
+        nn = np.arange(n)
+        i = np.rint(np.cos(2 * np.pi * k0 * nn / n) * amp) + dc
+        q = np.rint(np.sin(2 * np.pi * k0 * nn / n) * amp)
+        i = np.clip(i, -512, 511).astype(np.int64) & 0x3FF
+        q = np.clip(q, -512, 511).astype(np.int64) & 0x3FF
+        words = (i | (q << 10)).astype("<u4")
+
+        got = self._fixture_bins(words)
+        want = self._reference_bins(words)
+        no = self._reference_bins_noremove(words)
+        peak_want = int(np.max(want))
+        mask = want >= peak_want - 6000
+        diff = np.abs(got - want)[mask]
+        self.assertLessEqual(int(np.max(diff)), 30,
+                             f"tone+DC lobe diverges: {int(np.max(diff))}")
+        # centre bin: the offset collapses by >= 30 dB vs the old curve
+        centre = n // 2
+        self.assertLessEqual(int(got[centre]) - int(no[centre]), -3000,
+                             "tone+DC: centre not collapsed")
+        # off-centre lobe is untouched by the correction
+        lobe = int(np.argmax(want))
+        self.assertLessEqual(abs(int(got[lobe]) - int(no[lobe])), 30,
+                             "tone+DC: lobe changed")
 
     def test_noise_is_deterministic_and_finite(self) -> None:
         rng = np.random.default_rng(7)

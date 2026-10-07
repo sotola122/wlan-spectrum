@@ -9,7 +9,7 @@
  * Concurrency: monitor_radio_begin/monitor_radio_finish are task-only (the
  * application task). The promiscuous callback runs in the Wi-Fi task; it may
  * run concurrently with begin/finish and is serialized against them by
- * g_observation_lock. The callback performs bounded work only: no heap, no
+ * radio_state.lock. The callback performs bounded work only: no heap, no
  * logging, no USB, zero-timeout queue sends.
  *
  * Memory: initialization-only allocation. The sighting queue
@@ -44,8 +44,18 @@ esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel);
  * excluded from observed_ms. */
 void monitor_radio_finish(MonitorObservation *out);
 
-/* (diagnostic cca poll / trace replay / repeat-window decls removed —
- * the feature is a per-valid-dwell armed one-shot computed entirely inside
- * begin/finish; evidence raw logs remain in evidence/cca_*.) */
+/* Sampled PHY CCA (CURRENT pooled contract, no version key): up to
+ * EIGHT distributed one-shot windows per dwell. monitor_radio_begin
+ * attempts slot 0 (dwell start); the application calls this once per
+ * dwell-wait tick (10 ms).
+ * Scheduling uses ACTUAL elapsed time since begin:
+ * slot = floor(elapsed_us * 8 / dwell_us); a slot below the next pending
+ * index returns immediately (missed slots are skipped, never burst), and
+ * at most ONE window is attempted per call. Ticks too close to dwell end
+ * (< one window budget remaining) skip entirely so a window never
+ * straddles the dwell. Each window keeps the strict per-window bounds
+ * (reset proof, done+endpoint, <=5000 us, <=4M polls — frozen-clock
+ * safe). No-op when no dwell is active. */
+void monitor_radio_cca_tick(uint32_t dwell_ms);
 
 #endif /* MONITOR_RADIO_H */

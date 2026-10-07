@@ -446,8 +446,8 @@ static bool json_add_object(cJSON *object, const char *name, cJSON **out) {
     return true;
 }
 
-/* One rate_caps entry: {"code": k, "span_khz": v} (handoff v2.1; hosts
- * match rate_code against `code`, never array position). */
+/* One rate_caps entry: {"code": k, "span_khz": v} (docs/tlv-protocol.md;
+ * hosts match rate_code against `code`, never array position). */
 static bool json_array_add_rate_code(cJSON *array, double code,
                                      double span_khz) {
     if (array == NULL) {
@@ -519,7 +519,7 @@ size_t monitor_format_config_event(char *dst, size_t capacity_bytes,
     for (size_t i = 0; ok && i < event->channel_count; i++) {
         ok = json_array_add_number(channels, event->channels[i]);
     }
-    /* Spectrum capability block (evidence/spectrum-handoff.md v2.1):
+    /* Spectrum capability block (docs/tlv-protocol.md):
      * booleans are truth, the object fields are the effective values the
      * firmware will actually produce — never a fabricated echo. */
     ok = ok && json_add_bool(root, "spectrum", event->spectrum_available);
@@ -568,7 +568,8 @@ size_t monitor_format_config_event(char *dst, size_t capacity_bytes,
             ok = ok && json_add_string(util, "label",
                                        "sampled PHY CCA (experimental); "
                                        "NAV equivalence not established; "
-                                       "one armed one-shot, not the dwell");
+                                       "pooled sum of up to 8 sampled "
+                                       "short windows, not the dwell span");
         } else {
             ok = ok && json_add_string(util, "blocker",
                                        "cca_semantics_unproven");
@@ -634,24 +635,35 @@ size_t monitor_format_channel_event(char *dst, size_t capacity_bytes,
     }
     ok = ok && json_add_number(root, "ap_dropped",
                                obs->access_points_dropped);
-    /* CCA utilization (contract FINAL v1, evidence/spectrum-cca-contract-
-     * final.md): ENDPOINT one-shot, strict validity, truthful gap. Host
-     * computes 100*busy/total; no pairs, no frac here. */
-    if (ok && obs->util_valid && obs->util_total > 0 &&
-        obs->util_total <= 0x07ffffffu &&
+    /* CCA utilization (CURRENT pooled contract, no version key): sum of
+     * up to EIGHT distributed one-shot windows per valid dwell, each
+     * window strictly validated by the firmware. Absence of the object is
+     * the truthful gap (zero valid windows publish nothing). Host computes
+     * 100*busy/total over the pooled sums; window_us_upper is the SUM of
+     * the sampled short windows, never the dwell span. samples = valid
+     * windows (1..8), attempted = windows actually tried (samples..8). */
+    if (ok && obs->util_valid &&
+        obs->util_samples >= 1 && obs->util_samples <= 8 &&
+        obs->util_attempted >= obs->util_samples &&
+        obs->util_attempted <= 8 &&
+        obs->util_total >= obs->util_samples &&
+        obs->util_total <= obs->util_samples * 0x07ffffffu &&
         obs->util_busy <= obs->util_total &&
-        obs->util_window_us_upper > 0 &&
-        obs->util_window_us_upper <= 5000u) {
+        obs->util_window_us_upper >= obs->util_samples &&
+        obs->util_window_us_upper <= 5000u * obs->util_samples) {
         cJSON *u = NULL;
         ok = json_add_object(root, "util", &u);
         ok = ok && json_add_string(u, "source", "c5_v6.0.3_phy_cca_cnt");
         ok = ok && json_add_string(u, "confidence", "experimental_sampled");
         ok = ok && json_add_number(u, "busy", obs->util_busy);
         ok = ok && json_add_number(u, "total", obs->util_total);
+        ok = ok && json_add_number(u, "samples", obs->util_samples);
+        ok = ok && json_add_number(u, "attempted", obs->util_attempted);
         ok = ok && json_add_number(u, "window_us_upper",
                                    obs->util_window_us_upper);
     }
-        return json_print_and_free(root, ok, dst, capacity_bytes);
+    /* Not inside the if: a truthfully missing util still yields channel. */
+    return json_print_and_free(root, ok, dst, capacity_bytes);
 }
 
 size_t monitor_format_cycle_event(char *dst, size_t capacity_bytes,

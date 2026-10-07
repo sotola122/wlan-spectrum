@@ -645,7 +645,8 @@ class UtilContractTests(unittest.TestCase):
     @staticmethod
     def sample(**over) -> dict:
         d = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-             "busy": 100, "total": 65536, "window_us_upper": 819}
+             "busy": 100, "total": 65536, "samples": 3,
+             "attempted": 4, "window_us_upper": 819}
         d.update(over)
         return d
 
@@ -682,9 +683,9 @@ class UtilContractTests(unittest.TestCase):
             self.sample(busy=65537),           # B = A+1 endpoint: invalid
             self.sample(busy=-1),
             self.sample(total=0),
-            self.sample(total=0x08000000),     # beyond 27 bits
+            self.sample(total=3 * 0x07FFFFFF + 1),  # beyond pooled mask sum
             self.sample(window_us_upper=0),
-            self.sample(window_us_upper=5001),
+            self.sample(window_us_upper=15001),   # > 5000 * samples(3)
             self.sample(window_us_upper=True),
             self.sample(source="wrong"),
             self.sample(confidence="calibrated"),
@@ -697,6 +698,73 @@ class UtilContractTests(unittest.TestCase):
         self.assertIsNone(parse_channel_util("util"))
         self.assertIsNotNone(parse_channel_util(
             self.sample(extra_key="additive keys are tolerated")))
+
+    @staticmethod
+    def pooled(**over) -> dict:
+        d = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+             "busy": 100, "total": 40000, "samples": 3,
+             "attempted": 4, "window_us_upper": 3000}
+        d.update(over)
+        return d
+
+    def test_pooled_counts_and_storage(self) -> None:
+        # the single CURRENT pooled contract: counts are required, there is
+        # no communication versioning, and one valid measurement is simply
+        # samples == attempted == 1
+        pooled = parse_channel_util(self.pooled())
+        if pooled is None:
+            self.fail("pooled sample rejected")
+        self.assertEqual(pooled["samples"], 3)
+        self.assertEqual(pooled["attempted"], 4)
+        self.assertNotIn("version", pooled)   # no version key anywhere
+        self.assertIsNotNone(parse_channel_util(
+            self.pooled(samples=1, attempted=1)))
+        self.assertIsNotNone(parse_channel_util(
+            self.pooled(samples=1, attempted=1, busy=1, total=1,
+                        window_us_upper=1)))
+        self.assertIsNotNone(parse_channel_util(
+            self.pooled(busy=3, total=3, window_us_upper=3)))  # == samples
+        # the window budget scales with the valid sample count
+        self.assertIsNotNone(parse_channel_util(
+            self.pooled(samples=2, attempted=2, window_us_upper=10000)))
+        # counts are stored with the raw sample
+        self.assertTrue(self._ack(self.cap()))
+        self.assertTrue(self.state.accept(
+            channel_event(ch=6, cycle=1, util=self.pooled())))
+        stored = self.state.util_samples.get(6)
+        if stored is None:
+            self.fail("pooled sample not stored")
+        self.assertEqual(stored["samples"], 3)
+        self.assertEqual(stored["attempted"], 4)
+        self.assertNotIn("version", stored)
+
+    def test_pooled_numeric_bounds_rejected(self) -> None:
+        bad = [
+            self.pooled(samples=0),
+            self.pooled(samples=9),
+            self.pooled(samples=True),
+            self.pooled(attempted=2),           # attempted < samples(3)
+            self.pooled(attempted=9),
+            self.pooled(attempted=True),
+            self.pooled(busy=True),
+            self.pooled(busy=40001),            # busy > total(40000)
+            self.pooled(busy=-1),
+            self.pooled(total=3 * 0x07FFFFFF + 1),  # > samples * mask
+            self.pooled(total=True),
+            self.pooled(window_us_upper=0),
+            self.pooled(window_us_upper=15001),  # > 5000 * 3
+            self.pooled(window_us_upper=True),
+            # pooled lower bounds: sums below samples are impossible
+            self.pooled(busy=1, total=2),        # total < samples(3)
+            self.pooled(busy=1, total=1),
+            self.pooled(window_us_upper=2),      # window < samples(3)
+            self.pooled(window_us_upper=1),
+            self.pooled(source="wrong"),
+            self.pooled(confidence="calibrated"),
+        ]
+        for i, sample in enumerate(bad):
+            with self.subTest(i=i, sample=sample):
+                self.assertIsNone(parse_channel_util(sample))
 
     def test_channel_util_stored_gated_and_cleared(self) -> None:
         self.assertTrue(self._ack({"available": False,

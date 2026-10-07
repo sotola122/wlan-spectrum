@@ -90,6 +90,11 @@ void fake_cca_ctrl_set(uint32_t value) {
 static uint32_t g_fake_set_cnt_calls;
 static uint32_t g_fake_set_cnt_value;
 static uint32_t g_fake_set_cnt_arm;
+static bool g_fake_cca_arm_reset;
+
+void fake_cca_arm_reset(bool enable) {
+    g_fake_cca_arm_reset = enable;
+}
 
 void phy_set_cca_cnt(uint32_t value, uint32_t arm) {
     g_fake_set_cnt_calls++;
@@ -101,6 +106,11 @@ void phy_set_cca_cnt(uint32_t value, uint32_t arm) {
                       (value & 0x07ffffffu);
     if (arm != 0) {
         g_fake_cca_ctrl |= 0x18000000u;
+        if (g_fake_cca_arm_reset) {
+            /* device model: arming clears the counters */
+            g_fake_cca_a = 0;
+            g_fake_cca_b = 0;
+        }
     }
 }
 

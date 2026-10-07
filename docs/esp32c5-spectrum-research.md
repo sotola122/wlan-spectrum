@@ -8,7 +8,7 @@ This note records the initial source-only investigation, when the repository fir
 No board reset, flash, or register experiment was performed during that investigation.
 The subsequent independently written implementation now captures I/Q and computes FFTs on the pinned v6.0.3 SDK; both-band streaming and the shared GUI have been exercised on hardware.
 See [Firmware workflow](firmware.md#rf-spectrum-acceptance) for the later acceptance results and [Wi-Fi monitor](wifi-monitor.md) for current behavior.
-The source sections below describe that initial investigation. The final section records the subsequent CCA counter experiments separately.
+The source sections below describe that initial investigation. The later sections record the subsequent CCA counter experiments and center-frequency offset diagnosis separately.
 
 ## Primary implementation
 
@@ -90,3 +90,18 @@ Some completed windows reported B one count above A. The product rejects those w
 The protocol carries raw busy/total counters and an elapsed-time upper bound so that a percentage does not conceal its measurement interval. Missing or invalid windows remain unavailable, not zero.
 
 The paired-sample evidence is retained in the local session artifact `cca_ambient_probe-rows-20261007-132407.json` (SHA-256 `d7a10c0037aee64bf25a621568132e5ff6da6a3cad2e90f0eb6ce478da9ab912`). Those diagnostic observations are distinct from the final firmware/GUI acceptance described in the firmware workflow.
+
+## Center-frequency offset diagnosis
+
+Tall peaks at each tuned center were reproduced in measured FFT frames. The GUI's original upper bound of −20 dBFS clipped some peaks, but increasing that bound alone would not correct the underlying center component.
+
+A temporary diagnostic exported 64 raw complex sample words and the ordinary FFT from the same capture on each band. An independent direct DFT reproduced the wire values within 0.005 dB. Subtracting that capture's complex mean before the periodic Hann window gave the following offline results:
+
+| Capture | Original center, dBFS | Mean-subtracted center, dBFS |
+|---|---:|---:|
+| 2.4 GHz, channel 6 | −16.92 | −37.67 |
+| 5 GHz, channel 64 | −10.38 | −50.30 |
+
+Bins outside the center and its two immediate neighbors changed by less than 1.6e−12 dB in this calculation. These paired-input results support snapshot mean removal rather than a blanket dB offset or replacement of selected power bins. They do not identify the physical source of the offset or establish calibrated RF accuracy. Mean removal also suppresses a genuine constant complex component at the tuned center.
+
+The paired inputs and independent calculations are retained in local session artifacts `diag-raw-run1.json` and `parent-identical-iq-dft.json`. These are offline comparisons of identical real captures, not before/after ambient measurements from the final product image. The current transform and its limits are specified in the [TLV contract](tlv-protocol.md#35-0x04-spectrum_rf-device--pc).

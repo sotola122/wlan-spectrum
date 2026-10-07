@@ -9,7 +9,7 @@ It does not associate, perform active scanning, or transmit probe requests.
 RF snapshots are displayed in dBFS relative to the digital complex-I/Q full-scale reference, not calibrated antenna-input dBm.
 Packet RSSI is separate from FFT power and does not supply the spectrum trace.
 Received packets per second is not channel utilization, CCA busy time, or total RF airtime.
-At the start of a successful receive dwell, a short one-shot PHY counter window supplies an experimental sampled CCA busy fraction. It is not an average over the entire dwell or a measurement simultaneous with the later FFT.
+Short PHY counter windows distributed across each successful receive dwell supply an experimental sampled CCA busy fraction. Their valid busy and total counters are pooled before publication. This is not continuous measurement of the entire dwell or a measurement simultaneous with the later FFT.
 
 The firmware selects country `JP` and uses a conservative receive allowlist:
 
@@ -101,25 +101,29 @@ The optional `channel.util` object uses the channel event's `epoch`, `cycle`, `b
 |---|---|
 | `source` | `"c5_v6.0.3_phy_cca_cnt"` |
 | `confidence` | `"experimental_sampled"` |
-| `busy` | Final raw B counter from the completed one-shot; integer, `0 <= busy <= total` |
-| `total` | Final raw A counter, equal to the preserved configured limit; integer, `1..0x07ffffff` |
-| `window_us_upper` | Elapsed time from before arming to after the first completed read; integer microseconds, `1..5000` |
+| `samples` | Number of valid windows included in the sums, integer `1..8` |
+| `attempted` | Number of windows actually attempted, integer `samples..8` |
+| `busy` | Sum of final B counters from valid windows; integer, `0 <= busy <= total` |
+| `total` | Sum of final A counters from valid windows; integer, `samples..samples*0x07ffffff` |
+| `window_us_upper` | Sum of valid windows' elapsed-time upper bounds; integer microseconds, `samples..samples*5000` |
 
 The host computes `100 * busy / total` for the shared utilization bars and channel table. Demo's generated `0x02 CH_UTIL` values remain a separate input path.
-JSON booleans are not valid counter or duration values. Unknown additive keys do not change the meaning of these required fields.
+JSON booleans are not valid counts or durations. Unknown additive keys do not change the meaning of these required fields. This measurement uses the existing `wifi-monitor/1` event contract, with no separate utilization-version field or negotiation.
 
-The firmware reads the current counter limit, arms through the pinned SDK function, observes the reset/in-progress state, then requires the completion flag and the expected final total. It omits `util` if reset or completion cannot be observed within its bounded polling loop, the elapsed-time check fails, or `busy > total`.
-The observed one-count overflow is rejected, not clipped to 100%. An absent or rejected result clears the current channel value rather than reusing an earlier percentage.
+The firmware targets eight attempts distributed across the dwell, rather than eight consecutive measurements at its start. Missed slots are not replayed in a burst. Each attempt reads the current counter limit, arms through the pinned SDK function, observes the reset/in-progress state, then requires the completion flag and the expected final total. Polling has both elapsed-time and iteration bounds. A valid window has a positive elapsed-time bracket of at most 5000 microseconds and `0 <= B <= A`; the observed one-count overflow is rejected, not clipped to 100%.
 
-The UI identifies this source as sampled PHY CCA (experimental) and exposes its window metadata. Live applies channel results as they arrive; Sweep publishes staged results at cycle completion. Epoch changes, missing observations and incomplete cycles must not retain old values as current measurements.
+Only valid windows contribute to either counter sum or the time-bound sum. Failed windows are not counted as idle, and no valid window means no `util` object. The reported counts expose partial measurements. An absent or rejected result clears the current channel value rather than reusing an earlier percentage. Pooling reduces dependence on one short observation; it does not prevent genuine changes in bursty traffic or guarantee a stable percentage.
+
+The UI identifies this source as sampled PHY CCA (experimental). Tooltips expose valid/attempted counts, raw counter sums and the sum of window-time upper bounds. This time bound is not the interval from the first sample to the last, nor the whole dwell duration. No host-side temporal smoothing is applied. Live applies channel results as they arrive; Sweep publishes staged results at cycle completion. Epoch changes, missing observations and incomplete cycles must not retain old values as current measurements.
 Capability availability means that the implementation supports this path, not that every window is valid.
 
-The hardware experiments support a clocked, gated busy-counter interpretation on the tested C5 and v6.0.3 SDK. They do not establish calibrated accuracy, the energy threshold, equivalence to MAC/NAV airtime, or whole-dwell utilization. The typical counter window was approximately 0.8 ms within a dwell of at least 120 ms; `window_us_upper` includes polling and software overhead and is not an exact RF integration duration. See the [counter investigation](esp32c5-spectrum-research.md#subsequent-cca-counter-experiments).
+The hardware experiments support a clocked, gated busy-counter interpretation on the tested C5 and v6.0.3 SDK. They do not establish calibrated accuracy, the energy threshold, equivalence to MAC/NAV airtime, or whole-dwell utilization. An individual counter window was approximately 0.8 ms within a dwell of at least 120 ms. Its elapsed-time upper bound includes polling and software overhead, not just RF integration. Summing those bounds does not make it an exact integration duration. See the [counter investigation](esp32c5-spectrum-research.md#subsequent-cca-counter-experiments).
 
 ### RF spectrum
 
 The channel STATUS precedes its `0x04 SPECTRUM_RF` frame; the cycle marker follows all channel snapshots.
 The [RF frame contract](tlv-protocol.md#35-0x04-spectrum_rf-device--pc) defines its header, bin frequencies and normalization.
+The firmware subtracts each snapshot's complex I/Q mean before windowing and FFT. This removes the DC component that otherwise produces a peak at every tuned channel center. It also suppresses a genuine exact-center component and changes the adjacent Hann-window bins; this is not absolute RF calibration or a method for measuring an exact-center continuous-wave tone.
 The GUI resamples bins within each captured span onto the shared frequency grid; it does not infer measurements outside those spans.
 Current and waterfall use the real FFT data; peak hold intentionally retains historical maxima until reset.
 Coverage and Sweep staging are tied to epoch and cycle IDs, not Demo's end-frequency heuristic.

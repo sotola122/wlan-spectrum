@@ -25,6 +25,13 @@ void fake_cca_set(uint32_t a, uint32_t b, uint32_t flag);
 uint32_t fake_cca_ctrl_read(void);
 void fake_cca_ctrl_set(uint32_t value);
 
+/* Reset the fake A/B counters when phy_set_cca_cnt(arm=1) is called —
+ * models the device's arm-resets-counters behaviour so multi-window
+ * sequences see a fresh counter per window. Default OFF: the single-
+ * window cases that plant counter values before begin must keep
+ * seeing them survive the arm. */
+void fake_cca_arm_reset(bool enable);
+
 /* Recorder for the authorized one-shot arm call (native seam). */
 void phy_set_cca_cnt(uint32_t value, uint32_t arm);
 uint32_t fake_cca_set_cnt_calls(void);

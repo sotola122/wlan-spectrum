@@ -496,7 +496,7 @@ class RfRenderingTests(unittest.TestCase):
         self.deliver(channel_event(ch=6, util={"source": UTIL_SOURCE,
                                                "confidence": UTIL_CONFIDENCE,
                                                "busy": 4000, "total": 10000,
-                                               "window_us_upper": 819}))
+                                               "samples": 3, "attempted": 4, "window_us_upper": 819}))
         self.assertEqual(cell_text(self.win.ch_table, row_of(self.win, 6),
                                    2), "40 %")
         self.assertTrue(self.win._rf_active)          # still RF mode
@@ -507,7 +507,7 @@ class RfRenderingTests(unittest.TestCase):
                               "source": UTIL_SOURCE,
                               "confidence": UTIL_CONFIDENCE})
         util = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-                "busy": 0, "total": 65536, "window_us_upper": 819}
+                "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         # measured zero renders as 0 % - never a gap, never fake coverage
         self.deliver(channel_event(ch=6, util=util))
         self.assertEqual(cell_text(self.win.ch_table, row_of(self.win, 6),
@@ -544,7 +544,7 @@ class RfRenderingTests(unittest.TestCase):
                               "source": UTIL_SOURCE,
                               "confidence": UTIL_CONFIDENCE})
         util = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-                "busy": 0, "total": 65536, "window_us_upper": 819}
+                "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         # sweep stages but does NOT publish before the marker
         self.deliver(channel_event(ch=6, util=util))
         self.assertEqual(cell_text(self.win.ch_table, row_of(self.win, 6),
@@ -558,7 +558,7 @@ class RfRenderingTests(unittest.TestCase):
 
     def test_missing_cycles_and_lost_marker_never_reuse_percent(self) -> None:
         util = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-                "busy": 0, "total": 65536, "window_us_upper": 819}
+                "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         self.ack(utilization={"available": True,
                               "source": UTIL_SOURCE,
                               "confidence": UTIL_CONFIDENCE})
@@ -589,7 +589,7 @@ class RfRenderingTests(unittest.TestCase):
 
     def test_channel_error_clears_util_before_cycle(self) -> None:
         util = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-                "busy": 0, "total": 65536, "window_us_upper": 819}
+                "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         self.ack(utilization={"available": True,
                               "source": UTIL_SOURCE,
                               "confidence": UTIL_CONFIDENCE})
@@ -606,7 +606,7 @@ class RfRenderingTests(unittest.TestCase):
 
     def test_capability_loss_same_epoch_clears_display(self) -> None:
         util = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-                "busy": 0, "total": 65536, "window_us_upper": 819}
+                "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         self.ack(utilization={"available": True,
                               "source": UTIL_SOURCE,
                               "confidence": UTIL_CONFIDENCE})
@@ -627,7 +627,7 @@ class RfRenderingTests(unittest.TestCase):
         self.deliver(channel_event(ch=6, util={"source": UTIL_SOURCE,
                                                "confidence": UTIL_CONFIDENCE,
                                                "busy": 1, "total": 65536,
-                                               "window_us_upper": 819}))
+                                               "samples": 3, "attempted": 4, "window_us_upper": 819}))
         # the raw fraction survives in the data/bars; only the LABEL
         # rounds (display rounding, never data truncation)
         self.assertIn(6, self.win._util)
@@ -642,7 +642,7 @@ class RfRenderingTests(unittest.TestCase):
         cap = {"available": True, "source": UTIL_SOURCE,
                "confidence": UTIL_CONFIDENCE}
         util = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-                "busy": 0, "total": 65536, "window_us_upper": 819}
+                "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         self.win.mode_tabs.setCurrentIndex(1)
         self.ack(utilization=cap)
         self.deliver(channel_event(ch=6, cycle=1, util=util))  # staged
@@ -670,7 +670,7 @@ class RfRenderingTests(unittest.TestCase):
         cap = {"available": True, "source": UTIL_SOURCE,
                "confidence": UTIL_CONFIDENCE}
         base = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-                "busy": 0, "total": 65536, "window_us_upper": 819}
+                "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         self.win.mode_tabs.setCurrentIndex(1)
         self.ack(utilization=cap)
         # valid cycle0: two channels + marker0 -> published exact
@@ -701,6 +701,106 @@ class RfRenderingTests(unittest.TestCase):
                                    2), "20 %")    # 13107/65536 = 20%
         self.assertEqual(cell_text(self.win.ch_table, row_of(self.win, 1),
                                    2), "—")       # ch1 not in cycle1
+
+    def test_pooled_tooltip_identifies_counts_and_window(self) -> None:
+        cap = {"available": True, "source": UTIL_SOURCE,
+               "confidence": UTIL_CONFIDENCE}
+        self.ack(utilization=cap)
+        # pooled sample: counts + summed window + pooling wording
+        self.deliver(channel_event(ch=6, util={
+            "source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+            "busy": 0, "total": 40000, "samples": 3,
+            "attempted": 4, "window_us_upper": 3000}))
+        item = self.win.ch_table.item(row_of(self.win, 6), 2)
+        if item is None:
+            self.fail("util cell missing")
+        tip = item.toolTip() or ""
+        self.assertIn("Sampled PHY CCA (experimental)", tip)
+        self.assertIn("3 valid of 4 attempted", tip)
+        self.assertIn("window_us_upper 3000", tip)
+        self.assertIn("not the dwell span", tip)
+        card = self.win.util_card.toolTip() or ""
+        self.assertIn("Sampled PHY CCA (experimental)", card)
+        self.assertIn("not the dwell span", card)
+        # actual counts render for every sample; samples=1 is simply one
+        # valid measurement (no versioning anywhere)
+        self.deliver(channel_event(ch=1, util={
+            "source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+            "busy": 6554, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}))
+        item1 = self.win.ch_table.item(row_of(self.win, 1), 2)
+        if item1 is None:
+            self.fail("util cell missing")
+        tip1 = item1.toolTip() or ""
+        self.assertIn("window_us_upper 819", tip1)
+        self.assertIn("not the dwell span", tip1)
+        self.assertIn("3 valid of 4 attempted", tip1)
+        self.assertNotIn("version", tip1)
+
+    def test_rf_source_switch_defaults_ymax_to_zero(self) -> None:
+        # untouched default: the Demo-era -20 must become 0 dBFS on the
+        # transition INTO the RF source - never on Demo, heartbeats or data
+        self.assertEqual(self.win.db_max.value(), -20)
+        self.ack(utilization={"available": True, "source": UTIL_SOURCE,
+                              "confidence": UTIL_CONFIDENCE})
+        self.assertEqual(self.win.db_max.value(), 0)
+        self.assertIn("0 dBFS", self.win.db_max_lbl.text())
+        # repeated data must never auto-range
+        self.fx.deliver(rf_blob())
+        self.assertEqual(self.win.db_max.value(), 0)
+        # untouched: leaving RF restores the Demo default (-20); a manual
+        # choice would survive (covered by the manual-range test)
+        self.win.demo_btn.setChecked(True)
+        self.assertEqual(self.win.db_max.value(), -20)
+        self.win.demo_btn.setChecked(False)
+        self.assertEqual(self.win.db_max.value(), -20)
+
+    def test_manual_range_survives_source_switches_and_heartbeats(self) -> None:
+        cap = {"available": True, "source": UTIL_SOURCE,
+               "confidence": UTIL_CONFIDENCE}
+        self.ack(utilization=cap)          # entering RF: default 0
+        self.win.db_max.setValue(-5)       # manual user choice
+        self.assertEqual(self.win.db_max.value(), -5)
+        # same-epoch config heartbeat must not reset the range
+        self.ack(utilization=cap)
+        self.assertEqual(self.win.db_max.value(), -5)
+        # repeated data must not reset it
+        self.deliver(channel_event(ch=6, util={
+            "source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+            "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}))
+        self.assertEqual(self.win.db_max.value(), -5)
+        # Demo -> RF re-switch: the manual choice survives
+        self.win.demo_btn.setChecked(True)
+        self.win.demo_btn.setChecked(False)
+        self.assertEqual(self.win.db_max.value(), -5)
+        self.win._attach(self.fx)
+        self.fx.opened.emit()
+        self.ack(utilization=cap)          # re-enter RF
+        self.assertEqual(self.win.db_max.value(), -5)
+
+    def test_untouched_transitions_restore_demo_default_ymax(self) -> None:
+        cap = {"available": True, "source": UTIL_SOURCE,
+               "confidence": UTIL_CONFIDENCE}
+        self.ack(utilization=cap)              # RF enter: untouched -> 0
+        self.assertEqual(self.win.db_max.value(), 0)
+        # actual demo start path (demo toggle -> _detach -> MockSource)
+        self.win.demo_btn.setChecked(True)
+        self.assertFalse(self.win._rf_active)
+        self.assertEqual(self.win.db_max.value(), -20,
+                         "untouched RF preset must not persist into Demo")
+        self.win.demo_btn.setChecked(False)    # actual _detach path
+        self.assertEqual(self.win.db_max.value(), -20)
+        # RF again: untouched adopts 0 once more
+        self.win._attach(self.fx)
+        self.fx.opened.emit()
+        self.ack(utilization=cap)
+        self.assertEqual(self.win.db_max.value(), 0)
+        # status-driven RF clear (_on_monitor_status -> _sync_rf_state):
+        # an ack without spectrum capability also restores the Demo default
+        fields = config_from_frame(self.fx.writes[-1])
+        self.fx.deliver(tlv.encode_status_json(
+            rf_config_event(**fields, spectrum=False)))
+        self.assertFalse(self.win._rf_active)
+        self.assertEqual(self.win.db_max.value(), -20)
 
     def test_sweep_row_contains_only_its_own_cycle(self) -> None:
         """One history row per marker; closing/masking happens BEFORE the

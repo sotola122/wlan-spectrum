@@ -50,6 +50,41 @@ static long g_inject_at_delay = -1;
 static int g_site;                  /* 1 = main boundary, 2 = backoff */
 static int g_escape_reason;         /* 1 = cap (fail), 2 = observed (ok) */
 
+/* Radio-sequence recorder: B = successful begin (dwell opens), T = CCA
+ * slot tick, F = finish (dwell closed). App-side scheduling seam. */
+static char g_radio_evt[512];
+static void radio_evt(char c) {
+    size_t n = strlen(g_radio_evt);
+    if (n + 1 < sizeof g_radio_evt) {
+        g_radio_evt[n] = c;
+        g_radio_evt[n + 1] = '\0';
+    }
+}
+
+/* Every T must sit inside an open B..F dwell, no nested/reordered pairs,
+ * and the i-th CLOSED dwell carries exactly expect[i] ticks — the dwell
+ * cadence follows the active CONFIG (initial 1000 ms/13 ch sweep vs the
+ * injected 3000 ms/20 ch sweep give 12 vs 15 ticks). */
+static int radio_sequence_ok(const int *expect, int n_expect) {
+    int open = 0, since_b = 0, closed = 0;
+    for (const char *p = g_radio_evt; *p; p++) {
+        if (*p == 'B') {
+            if (open) return 0;
+            open = 1;
+            since_b = 0;
+        } else if (*p == 'F') {
+            if (!open || closed >= n_expect) return 0;
+            if (since_b != expect[closed]) return 0;
+            open = 0;
+            closed++;
+        } else if (*p == 'T') {
+            if (!open) return 0;
+            since_b++;
+        }
+    }
+    return !open && closed == n_expect;   /* escape lands on a boundary */
+}
+
 static void inject_pending_config(void);
 
 /* ------------------------------------------------- recorded submissions */
@@ -204,14 +239,21 @@ esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel) {
     }
     g_radio_band = band;
     g_radio_channel = channel;
+    radio_evt('B');
     return ESP_OK;
 }
 
 void monitor_radio_finish(MonitorObservation *out) {
+    radio_evt('F');
     memset(out, 0, sizeof(*out));
     out->band = g_radio_band;
     out->channel = g_radio_channel;
     out->observed_ms = 120;
+}
+
+void monitor_radio_cca_tick(uint32_t dwell_ms) {
+    (void)dwell_ms;
+    radio_evt('T');
 }
 
 
@@ -231,7 +273,9 @@ int64_t esp_timer_get_time(void) {
 void vTaskDelay(TickType_t ticks) {
     g_time_us += (int64_t)ticks * 1000;
     g_delay_count++;
-    if (g_site == 3 && g_delay_count >= 8) {
+    if (g_site == 3 && g_delay_count >= 14) {
+        /* 10 ms dwell steps: ch1 dwell = 12 delays, channel_error fires at
+         * the ch1 boundary, ch2 adds 2 more delays -> stop there. */
         g_escape_reason = 3;            /* scenario 3: enough dwells seen */
         longjmp(g_escape, 3);
     }
@@ -347,6 +391,27 @@ int main(int argc, char **argv) {
         }
         printf("site%d ack-first ok (%zu frames, %ld delays)\n",
                g_site, g_record_count, g_delay_count);
+        if (g_site == 1) {
+            /* Scheduling seam: ticks only inside an open dwell; block 1 =
+             * initial sweep (dwell 120 ms -> 12 ticks), block 2 = epoch-2
+             * injected sweep 3000 ms/20 ch (dwell 150 ms -> 15 ticks). */
+            static const int expect[2] = {12, 15};
+            if (g_radio_evt[0] != 'B' || !radio_sequence_ok(expect, 2)) {
+                fprintf(stderr, "site1: FAIL: radio sequence (%.80s)\n",
+                        g_radio_evt);
+                return 1;
+            }
+            printf("site1 dwell-tick-schedule ok (%.64s)\n", g_radio_evt);
+        } else {
+            /* Backoff: begin never succeeds -> no dwell, no CCA ticks. */
+            if (strchr(g_radio_evt, 'B') != NULL ||
+                strchr(g_radio_evt, 'T') != NULL) {
+                fprintf(stderr, "site2: FAIL: ticks during backoff (%.80s)\n",
+                        g_radio_evt);
+                return 1;
+            }
+            printf("site2 backoff-no-ticks ok\n");
+        }
         return 0;
     }
     fprintf(stderr, "site%d: unreachable\n", g_site);

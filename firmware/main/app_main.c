@@ -24,7 +24,11 @@
 #include "nvs_flash.h"
 
 #define HEARTBEAT_PERIOD_US 1000000
-#define DWELL_POLL_STEP_MS 20
+#define DWELL_POLL_STEP_MS 10      /* dwell wait: link poll + CCA slot tick;
+                                    * targets all 8 slots under normal window
+                                    * timing, not guaranteed (missed slots
+                                    * surface via attempted) */
+#define CHANNEL_ERROR_BACKOFF_POLL_MS 20  /* error-backoff cadence */
 #define CHANNEL_ERROR_BACKOFF_LIMIT_MS 1000
 
 /* CONFIG defaults: live, 2.4 GHz, 1000 ms, FFT 64, 20000 kHz. */
@@ -41,11 +45,10 @@ static uint8_t g_channel_list[MONITOR_MAX_CHANNELS];
 static char g_json_buffer[MONITOR_JSON_CAPACITY_BYTES];
 static int64_t g_next_heartbeat_us;
 /* Spectrum state: available only after monitor_capture_init succeeds (the
- * handoff forbids advertising capabilities the board cannot prove). Static
+ * wire contract never advertises capabilities the board cannot prove —
+ * docs/tlv-protocol.md). Static
  * measurement buffers — no heap, application task only. */
 static bool g_spectrum_available;
-static bool g_util_available = true;   /* CAPABILITY (contract FINAL):
-   support declared from boot; per-dwell validity is the presence of util */
 static int16_t g_spectrum_bins[MONITOR_SPECTRUM_MAX_BINS];
 
 static uint32_t uptime_ms(void) {
@@ -74,7 +77,8 @@ static void send_config_event(void) {
         .channel_count = channel_count,
         .tx_dropped = monitor_link_tx_dropped(),
         .spectrum_available = g_spectrum_available,
-        .utilization_available = g_util_available,
+        .utilization_available = true,   /* capability from boot; per-dwell
+                                           truth is the presence of util */
         .effective_fft_size = effective_fft,
         .effective_rate_code = effective_code,
         .effective_span_khz = monitor_spectrum_rate_khz(effective_code),
@@ -125,8 +129,8 @@ static void send_channel_error(uint8_t channel, const char *code) {
 
 /* One snapshot spectrum for the just-reported channel. Contract order:
  * STATUS channel event precedes this frame; failure emits channel_error
- * with "spectrum_capture" and NO spectrum frame (handoff v2.1 missing
- * semantics: the host draws a gap, never a fabricated floor). */
+ * with "spectrum_capture" and NO spectrum frame (missing-semantics rule
+ * docs/tlv-protocol.md: the host draws a gap, never a fabricated floor). */
 static void send_spectrum(const MonitorObservation *observation) {
     uint16_t fft =
         monitor_spectrum_effective_fft_size(g_run.active_config.fft_size);
@@ -214,7 +218,7 @@ void app_main(void) {
         fatal_error_loop(esp_err_to_name(err));
     }
     /* Spectrum engine: on failure the stream keeps running with
-     * spectrum:false — never fabricated frames (handoff v2.1). */
+     * spectrum:false — never fabricated frames (docs/tlv-protocol.md). */
     g_spectrum_available = monitor_capture_init() == ESP_OK;
 
     send_config_event();
@@ -254,10 +258,12 @@ void app_main(void) {
                 monitor_radio_begin(g_run.active_config.band, channel);
             if (tune_err != ESP_OK) {
                 send_channel_error(channel, esp_err_to_name(tune_err));
-                /* Bound the error rate; keep polling (not consuming) link. */
+                /* Bound the error rate; keep polling (not consuming) link.
+                 * Backoff keeps the original 20 ms cadence — no CCA ticks
+                 * here (no dwell is open on a failed begin). */
                 for (uint32_t waited = 0;
                      waited < CHANNEL_ERROR_BACKOFF_LIMIT_MS;
-                     waited += DWELL_POLL_STEP_MS) {
+                     waited += CHANNEL_ERROR_BACKOFF_POLL_MS) {
                     poll_link();
                     MonitorBoundary backoff_boundary = check_boundary();
                     if (backoff_boundary == MONITOR_BOUNDARY_APPLY) {
@@ -268,24 +274,28 @@ void app_main(void) {
                     if (backoff_boundary == MONITOR_BOUNDARY_ACK) {
                         send_config_event();
                     }
-                    vTaskDelay(pdMS_TO_TICKS(DWELL_POLL_STEP_MS));
+                    vTaskDelay(pdMS_TO_TICKS(CHANNEL_ERROR_BACKOFF_POLL_MS));
                 }
                 if (cycle_discarded) {
                     break;
                 }
                 continue;
             }
-            /* Dwell wait: poll every 20 ms; a changed CONFIG applies only
-             * at the next channel boundary, never mid-dwell. */
+            /* Dwell wait: poll + CCA slot tick every 10 ms; scheduling
+             * uses actual elapsed time inside monitor_radio_cca_tick, and
+             * a changed CONFIG still applies only at the next channel
+             * boundary, never mid-dwell. */
             for (uint32_t waited = 0; waited < dwell_ms;
                  waited += DWELL_POLL_STEP_MS) {
                 vTaskDelay(pdMS_TO_TICKS(DWELL_POLL_STEP_MS));
                 poll_link();
+                monitor_radio_cca_tick(dwell_ms);
             }
             MonitorObservation observation;
             monitor_radio_finish(&observation);
             send_channel_event(&observation);
-            /* Ordering contract (handoff v2.1): STATUS channel event first,
+            /* Ordering contract (docs/tlv-protocol.md): STATUS channel
+             * event first,
              * then this channel's 0x04 SPECTRUM_RF frame, then the next
              * channel. Capture runs with promiscuous reception off, between
              * finish and the next begin. */

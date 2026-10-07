@@ -154,6 +154,36 @@ class FixtureMatrixTests(unittest.TestCase):
                                                   for f in rep.failures),
                                 rep.failures)
 
+    def test_pooled_util_contract_in_checker(self) -> None:
+        by_name = {n: (s, r, ok, sub)
+                   for n, s, r, ok, sub in self_test_cases()}
+        # pooled contract accepted, counts logged as actual valid events
+        stream, request, expect_ok, _ = by_name[
+            "util-pooled-samples-accepted"]
+        self.assertTrue(expect_ok)
+        messages, errors = _parse(*stream)
+        rep = finalize(evaluate(request,
+                                [(0.0, m) for m in messages]),
+                       tlv_errors=errors, ack_errors=0, min_cycles=1)
+        self.assertTrue(rep.ok, rep.failures)
+        self.assertEqual(rep.util_events, 3)
+        # count/overflow/bounds faults rejected
+        for name in ("util-sample-count-out-of-range-fails",
+                     "util-attempted-below-samples-fails",
+                     "util-window-sum-over-budget-fails",
+                     "util-total-over-mask-sum-fails"):
+            with self.subTest(case=name):
+                stream, request, expect_ok, substring = by_name[name]
+                self.assertFalse(expect_ok)
+                messages, errors = _parse(*stream)
+                rep = finalize(evaluate(request,
+                                        [(0.0, m) for m in messages]),
+                               tlv_errors=errors, ack_errors=0, min_cycles=0)
+                self.assertFalse(rep.ok)
+                self.assertTrue(substring and any(substring in f
+                                                  for f in rep.failures),
+                                rep.failures)
+
     def test_missing_coverage_and_coldjoin_notes(self) -> None:
         by_name = {n: (s, r, ok, sub)
                    for n, s, r, ok, sub in self_test_cases()}

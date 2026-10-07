@@ -4,7 +4,7 @@
  * No SDK, RTOS, or MCU headers (CODING_GUIDELINE section 6); the IDF capture
  * adapter lives in monitor_capture.h.
  *
- * Wire contract: evidence/spectrum-handoff.md v2.1 (frozen layout, frozen
+ * Wire contract: docs/tlv-protocol.md (frozen layout, frozen
  * units). Bins are centi-dBFS (int16, 0.01 dB) relative to a full-scale
  * complex tone; this is not dBm and must never be converted to RSSI.
  *
@@ -13,11 +13,15 @@
  * fixed-size twiddle table exactly once. No allocation after init: all
  * buffers are file-scope statics, documented and bounded (MAX bins = 1024).
  *
- * Normalization (frozen): periodic Hann w[n]=0.5*(1-cos(2*pi*n/N)),
- * W=sum(w), X=FFT(x*w), P=|X|^2 / W^2 (complex two-sided convention — NO
- * factor 4), dBFS=10*log10(P), encoded as round(dBFS*100) clamped to int16,
- * floored at -32768. A full-scale complex tone on a bin center reads 0 dBFS;
- * half amplitude reads about -602 (centi-dB).
+ * Normalization (frozen): per-capture DC removal FIRST — subtract the
+ * capture's own mean I and mean Q from the raw samples (explicit
+ * limitation: a true signal exactly at the tuned centre is removed with
+ * the offset; subtraction only, no notch/interpolation/absolute offset) —
+ * then periodic Hann w[n]=0.5*(1-cos(2*pi*n/N)), W=sum(w), X=FFT(x*w),
+ * P=|X|^2 / W^2 (complex two-sided convention — NO factor 4),
+ * dBFS=10*log10(P), encoded as round(dBFS*100) clamped to int16,
+ * floored at -32768. A full-scale complex tone on a bin center reads
+ * 0 dBFS; half amplitude reads about -602 (centi-dB).
  *
  * Bin order (frozen, fftshift): bin k of N sits at
  * center_khz - span_khz/2 + k*span_khz/N; DC (even N) at k = N/2.

@@ -44,7 +44,8 @@ SYNTHETIC_CHANNELS = {0: [1, 3, 6, 9, 11, 13],
 SYNTH_FFT_SIZES = [64, 128, 256]
 # True only for --self-test (PTY + SYNTHETIC device): fixture-specific
 # expectations (measured-zero cell, positive cell, intentional gap channel)
-# must NEVER run against a real device on --port.
+# are REGRESSION coverage for the synthetic path and must NEVER run
+# against a real device on --port.
 SYNTHETIC_RUN = False
 SYNTH_RATES = [{"code": 0, "span_khz": 20000},
                {"code": 1, "span_khz": 40000}]
@@ -83,11 +84,12 @@ def header_text(win: MainWindow, col: int) -> str:
 
 def check_util_column(win: MainWindow, synthetic: bool) -> None:
     """Real utilization acceptance (physical --port AND PTY): contract
-    facts only, no fixture assumptions. Verifies nonempty valid raw
-    samples, the exact 100*busy/total mapping into cells/bar heights, raw
-    metadata in the tooltip, no percent without raw data, and the honest
-    UNAVAILABLE state. Fixture properties run only when synthetic=True
-    (PTY/unit); a legitimate all-zero real snapshot passes."""
+    facts only for the ambient path - nonempty valid raw samples, the
+    exact 100*busy/total mapping into cells/bar heights, pooled-window
+    identification plus raw valid/attempted metadata in the tooltip, no
+    percent without raw data, the honest UNAVAILABLE state (a legitimate all-zero
+    real snapshot passes). synthetic=True (PTY/unit) additionally runs
+    the fixture-property regression checks at the end."""
     channels = BANDS[win.band].channels
     cells = [cell_text(win, r, 2) for r in range(win.ch_table.rowCount())]
     if not win.monitor_state.utilization_available:
@@ -131,20 +133,36 @@ def check_util_column(win: MainWindow, synthetic: bool) -> None:
                   and f"total {sample['total']}" in tip
                   and f"window_us_upper {sample['window_us_upper']}" in tip,
                   f"ch {ch}: tooltip must expose raw busy/total/window")
+            check("not the dwell span" in tip,
+                  f"ch {ch}: tooltip must identify the pooled window")
+            check(f"{sample['samples']} valid of "
+                  f"{sample['attempted']} attempted" in tip,
+                  f"ch {ch}: tooltip must show valid/attempted counts")
         else:
             check(text in ("—", ""),
                   f"ch {ch}: absent raw sample must render no percent "
                   f"(got {text!r})")
-    check("Sampled PHY CCA (experimental)" in (win.util_card.toolTip() or ""),
+    card_tip = win.util_card.toolTip() or ""
+    check("Sampled PHY CCA (experimental)" in card_tip,
           "util tooltip must label Sampled PHY CCA (experimental)")
+    check("not the dwell span" in card_tip,
+          "card tooltip must identify pooled (not dwell) windows")
     windows = [s["window_us_upper"] for s in raw.values()]
     fractions = [100.0 * s["busy"] / s["total"] for s in raw.values()]
-    print(f"[util] n={len(raw)} window_us=[{min(windows)}..{max(windows)}] "
+    print(f"[util] n={len(raw)} "
+          f"window_us=[{min(windows)}..{max(windows)}] "
           f"raw busy/total=[{min(s['busy'] for s in raw.values())}.."
           f"{max(s['total'] for s in raw.values())}] "
           f"fraction=[{min(fractions):.3f}..{max(fractions):.3f}]%")
     if synthetic:
-        # SYNTHETIC-fixture properties only (PTY/unit): never on --port
+        # SYNTHETIC-fixture properties only (PTY/unit): regression
+        # coverage, never an ambient/physical requirement. The snapshot
+        # may land mid-cycle (e.g. right after a band switch): pump Qt
+        # until the fixture's positive sample has been published.
+        wait(lambda: any(v > 0 for v in win._util.values()), 5.0,
+             "synthetic positive util sample to settle")
+        cells = [cell_text(win, r, 2)
+                 for r in range(win.ch_table.rowCount())]
         check(any(c == "0 %" for c in cells),
               "synthetic: measured busy=0 must render as 0 %")
         check(any(c.endswith(" %") and c != "0 %" for c in cells),
@@ -264,7 +282,8 @@ class SyntheticDevice(threading.Thread):
             payload["util"] = {"source": UTIL_SOURCE,
                                "confidence": UTIL_CONFIDENCE,
                                "busy": busy, "total": total,
-                               "window_us_upper": 819}
+                               "samples": 3, "attempted": 4,
+                               "window_us_upper": 2400}
         return tlv.encode_status_json(payload)
 
     def _cycle_marker(self) -> bytes:
@@ -389,6 +408,8 @@ def step_rf_ready(win: MainWindow, shots, timeout: float) -> None:
           "axis label must be dBFS")
     check(header_text(win, 3) == "Peak dBFS",
           "sidebar header must say Peak dBFS")
+    check(win.db_max.value() == 0,
+          "RF source switch must default the axis ymax to 0 dBFS")
     if win.monitor_state.utilization_available:
         check("UNAVAILABLE" not in win.util_card.cap_lbl.text(),
               "proven utilization must not read UNAVAILABLE")
@@ -452,7 +473,7 @@ def step_frame_renders(win: MainWindow, shots) -> None:
               "utilization column stays '—' without a proven source")
     print(f"[ok] frames rendered (cur {finite_frac(win.cur):.0%} finite)")
     warmup_waterfall(win, 30)               # >=30 real rows before the shot
-    check_util_column(win, SYNTHETIC_RUN)   # after warmup: cycles arrived
+    check_util_column(win, SYNTHETIC_RUN)
     shot(win, shots / "03-rf-live.png") if shots else None
 
 
@@ -558,7 +579,7 @@ def step_sweep_cycle_and_count(win: MainWindow, shots) -> None:
     check(win.sweep_lbl.text().startswith("2 /"),
           f"sweep label must read 2 / 2, got {win.sweep_lbl.text()}")
     print("[ok] finite sweep count stops play at 2 / 2")
-    check_util_column(win, SYNTHETIC_RUN)   # sweep util must flush at marker
+    check_util_column(win, SYNTHETIC_RUN)   # sweep util flush at marker
     shot(win, shots / "05-sweep.png") if shots else None
 
 
@@ -577,7 +598,7 @@ def step_band5g(win: MainWindow, shots) -> None:
           == len(BANDS[1].channels), "5 GHz sidebar rebuilt")
     print(f"[ok] 5 GHz renders ({finite.size} grid points)")
     warmup_waterfall(win, 30)               # >=30 real rows before the shot
-    check_util_column(win, SYNTHETIC_RUN)   # after warmup: cycles arrived
+    check_util_column(win, SYNTHETIC_RUN)
     shot(win, shots / "06-rf-5g.png") if shots else None
 
 
@@ -631,6 +652,10 @@ def step_reconnect(win: MainWindow, shots) -> None:
               f"epoch must never regress "
               f"({epoch_before} -> {epoch_after})")
     wait(lambda: np.isfinite(win.cur).any(), 8.0, "reconnect renders")
+    check(win.db_max.value() == 0,
+          "ymax default must survive the reconnect source switch")
+    check(win.db_min.value() == -90,
+          "manually chosen range must survive source re-switching")
     print(f"[ok] disconnect clears, reconnect re-renders "
           f"(epoch {epoch_before} -> {epoch_after}; "
           f"identical CONFIG may keep the epoch)")

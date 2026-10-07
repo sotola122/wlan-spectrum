@@ -124,18 +124,27 @@ typedef struct {
     MonitorAccessPoint access_points[MONITOR_MAX_ACCESS_POINTS];
     uint8_t access_point_count;
     uint32_t access_points_dropped;    /* unique-BSSID overflow + queue drops */
-    /* Sampled PHY CCA busy window (contract FINAL
-     * evidence/spectrum-cca-contract-final.md): armed one-shot per VALID
-     * dwell, parameter read from the control word at the call site
-     * (no literal, no other registers). ENDPOINT fields: busy = B final,
-     * total = A final (== the arm parameter); the formatter emits the
-     * frozen 5-field util object only when strictly valid — absence is the
-     * truthful gap (host computes 100*busy/total). NAV equivalence not
-     * established; not full-dwell; not calibrated energy. */
+    /* Sampled PHY CCA (CURRENT pooled contract, no version key): pooled
+     * endpoint of up to EIGHT distributed armed one-shot windows per
+     * VALID dwell, each window strictly validated (reset proof,
+     * done+endpoint, B<=A, bracket >0 and <=5000 us, independent poll
+     * bound). Fields:
+     *   util_valid       >= 1 valid window this dwell (else gap/nothing)
+     *   util_busy        SUM of valid endpoint B (bounded: 8 x mask)
+     *   util_total       SUM of valid endpoint A (bounded: 8 x mask)
+     *   util_window_us_upper SUM of the valid wall-time brackets
+     *                        (sum of SHORT windows, NOT the dwell span)
+     *   util_samples     number of valid windows, 1..8
+     *   util_attempted   windows actually attempted, samples..8
+     * Missing/invalid windows contribute NOTHING (never zero-filled);
+     * attempted < 8 is reported honestly (missed slots are skipped, never
+     * burst-caught-up). NAV equivalence not established; not full-dwell. */
     bool util_valid;
-    uint32_t util_window_us_upper;      /* arm -> first-done upper bound, us */
-    uint32_t util_busy;                 /* B final at completion */
-    uint32_t util_total;                /* A final at completion (== limit) */
+    uint32_t util_window_us_upper;      /* sum of valid arm->done brackets */
+    uint32_t util_busy;                 /* sum of valid endpoint B */
+    uint32_t util_total;                /* sum of valid endpoint A */
+    uint8_t util_samples;               /* valid windows, 1..8 when valid */
+    uint8_t util_attempted;             /* attempted windows, 1..8 */
 } MonitorObservation;
 
 /* Reset counters for a new dwell. Task context only (radio capture disabled). */
@@ -171,7 +180,7 @@ typedef struct {
     const uint8_t *channels;            /* borrowed for the call only */
     size_t channel_count;
     uint32_t tx_dropped;
-    /* Spectrum capability truth (evidence/spectrum-handoff.md v2.1):
+    /* Spectrum capability truth (docs/tlv-protocol.md):
      * spectrum_available only after hardware capture proved working; the
      * effective_* fields are the values the firmware will actually use
      * (never a blind echo of the request). utilization_available declares

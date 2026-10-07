@@ -236,8 +236,15 @@ class UtilContractDeviceTests(unittest.TestCase):
             sample = parse_channel_util(msg.get("util"))
             if sample is None:
                 self.fail(f"channel {ch}: non-contract util sample")
+            # the synthetic device speaks the pooled contract (no versioning)
+            self.assertNotIn("version", msg.get("util") or {})
+            self.assertEqual(sample["samples"], 3)
+            self.assertEqual(sample["attempted"], 4)
             self.assertLessEqual(sample["busy"], sample["total"])
-            self.assertLessEqual(sample["window_us_upper"], 5000)
+            self.assertLessEqual(sample["window_us_upper"],
+                                 5000 * sample["samples"])
+            self.assertTrue(1 <= sample["samples"] <= 8)
+            self.assertTrue(sample["samples"] <= sample["attempted"] <= 8)
         # first channel is a MEASURED zero (busy=0), still valid
         first = next(m for m in tlv.TlvParser().feed(
             dev._channel_event(channels[0])) if isinstance(m, tlv.Status)).data
@@ -288,6 +295,7 @@ class UtilColumnCheckerTests(unittest.TestCase):
             ch=6, util={"source": UTIL_SOURCE,
                         "confidence": UTIL_CONFIDENCE,
                         "busy": 1, "total": 65536,
+                        "samples": 1, "attempted": 1,
                         "window_us_upper": 819})))
         self.assertIn(6, self.win._util)
         check_util_column(self.win, synthetic=False)   # exact mapping passes

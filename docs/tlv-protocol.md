@@ -253,9 +253,16 @@ The lower edge is included; the upper edge is excluded. DC is at `i=n/2`.
 Each frame's center is authoritative because acquisition hops channels; a
 single CONFIG-level center cannot describe an entire traversal.
 
-Power uses a full-scale complex-I/Q reference and a periodic Hann window:
-`X = FFT(x*w)`, `W = sum(w)`, `P = abs(X)^2/W^2`, and `dBFS = 10*log10(P)`.
-A unit-amplitude complex tone on a bin center is 0 dBFS. There is no extra
+Power uses a full-scale complex-I/Q reference. The complex mean of each
+snapshot is subtracted before applying the periodic Hann window:
+`y = x - mean(x)`, `X = FFT(y*w)`, `W = sum(w)`, `P = abs(X)^2/W^2`, and
+`dBFS = 10*log10(P)`.
+A unit-amplitude complex tone on a non-DC FFT-bin center is 0 dBFS.
+Mean removal suppresses receiver DC offset, but also suppresses a genuine
+constant complex component at the tuned center. With this window, the
+correction affects the center bin and its two immediate neighbors; those
+bins must not be treated as an unbiased measurement of an exact-center tone.
+No power bins are replaced by an interpolated floor. There is no extra
 factor of four from a real-signal, one-sided spectrum convention. Integer
 encoding rounds `100*dBFS` and clamps to int16. Missing captures are absent
 frames, not fabricated floor samples; spectral background is not calibrated
@@ -281,7 +288,9 @@ as a CCA busy-time percentage.
 The pinned C5 implementation carries experimental sampled PHY CCA counters
 in the optional STATUS `channel.util` object, using the same channel-event
 epoch and cycle. See [sampled PHY CCA](wifi-monitor.md#sampled-phy-cca) for its
-raw counters, validity rules and window-time upper bound. It does not reuse
+raw counter sums, valid/attempted counts and window-time upper bounds.
+The existing `wifi-monitor/1` contract pools up to eight valid windows distributed
+across a dwell, without a separate utilization-version field. It does not reuse
 Demo's `0x02 CH_UTIL` frames or claim whole-dwell airtime coverage.
 
 An independent codec fixture (eight bins for the wire-format test, not a

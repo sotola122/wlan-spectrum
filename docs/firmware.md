@@ -173,9 +173,36 @@ Only one process may own the COM port at a time. The [Windows wslc build](#build
 
 ## Hardware verification
 
+### Mean removal and multi-window CCA acceptance
+
+The snapshot-mean correction and distributed CCA implementation were built with EIM and Podman on ESP-IDF v6.0.3. The EIM application image programmed over CP2102N USB-UART and verified by esptool has SHA-256 `98135319a70359a573e787911214ffbd2bbc0af0413ce043b8e1956194d0f605`. Temporary raw-I/Q diagnostic telemetry is absent from this product image. Communication remains `wifi-monitor/1`, with no separate utilization-version field.
+
+The final combined test suite passed 235 tests. Regressions cover mean removal before Hann, non-DC tones with an added offset, distributed scheduling, mixed valid/invalid windows, skipped slots without catch-up bursts, repeated finish, and the real application dwell loop. Radio lifecycle state is held by one private `RadioState`, with callback-shared locked fields separated from application-task-only CCA state. Fixed FFT and transport buffers retain static storage.
+
+The following physical checks used the same image and frozen host checkers at 921600 baud:
+
+| Band | Mode | Duration | RF frames | Valid utilization events | Cycle markers | Exit |
+|---|---|---:|---:|---:|---:|---:|
+| 2.4 GHz | Live | 60 s | 467 | 467 | 36 | 0 |
+| 2.4 GHz | Sweep | 60 s | 467 | 467 | 35 | 0 |
+| 5 GHz | Live | 60 s | 466 | 466 | 23 | 0 |
+| 5 GHz | Sweep | 60 s | 466 | 466 | 23 | 0 |
+
+The 5 GHz runs reported 5 and 8 dropped AP sightings, respectively; these are not RF-frame drops. The initial partial cycle in the first Live run was explicitly excluded from coverage, not silently counted as complete.
+
+Separate 45-second-per-band captures at 20 MS/s collected 703 FFT-64 frames and 542 FFT-1024 frames. Independent replay through the production parser reproduced every recorded power bin and utilization field, with zero discarded bytes in those raw recordings. All 1245 utilization events reported eight attempts and five to eight valid windows. Rejected windows contributed to neither counter sum. These observations establish actual distributed sampling, not guaranteed whole-dwell coverage or a fixed percentage under changing traffic.
+
+The physical-device GUI harness passed all 11 steps, including both bands, FFT/rate changes, Sweep publication, pause/resume, reconnect and Demo restoration. Screenshots showed the corrected center-frequency behavior, RF dBFS units and populated waterfall history. The untouched RF upper bound is 0 dBFS; manual limits remain user-owned. This was Linux offscreen Qt against the real serial device, not Windows desktop validation.
+
+One GUI session displayed a cumulative TLV discarded-byte count of 1576, unchanged between the inspected Live and 5 GHz screenshots. A rerun passed and its inspected Live screenshot showed zero, but the original count was not timestamped by phase. Its origin is therefore not established, and the clean raw-capture results must not be substituted for a claim of zero GUI-session errors. The protocol and receiver-pause limitations below still apply.
+
+The local evidence is under `.hermes/agent-sessions/pi/2026-10-07-spectrum-level/evidence/`: `product-flash.log`, `final-build-hashes.txt`, `parent-final-suite.log`, `pre-hil-smoke-*.log`, `postfix-run{4,5}-*`, `parent-postfix-raw-verification.json`, and `postfix-gui-harness*.log`. The paired-input basis for mean removal is recorded in the [center-frequency diagnosis](esp32c5-spectrum-research.md#center-frequency-offset-diagnosis). These results do not establish calibrated dBm or the physical origin of the receiver offset. The longer tests below belong to earlier images, not this revision.
+
 ### RF and sampled-CCA acceptance
 
-The final sampled-CCA implementation was built with EIM and Podman on ESP-IDF v6.0.3. The EIM application image programmed and hash-verified over CP2102N USB-UART has SHA-256 `09af9396660752dc64bf685362f945f017a0feb10e9b940488516b4a7b271971`.
+These results describe the single-window sampled-CCA baseline, before snapshot mean removal and distributed multi-window sampling. They do not establish acceptance of those later changes.
+
+That implementation was built with EIM and Podman on ESP-IDF v6.0.3. The EIM application image programmed and hash-verified over CP2102N USB-UART has SHA-256 `09af9396660752dc64bf685362f945f017a0feb10e9b940488516b4a7b271971`.
 The following tests used that running image and frozen host checkers at 921600 baud:
 
 | Band | Mode | Duration | RF frames | Valid CCA samples | Cycle markers | Exit |

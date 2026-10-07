@@ -7,9 +7,14 @@ CRC32-protected TLV frames. Real spectra use relative **dBFS**, not calibrated
 antenna-input dBm. Packet RSSI and AP sightings are separate protocol observations.
 Real and **Demo (mock)** sources use the same spectrum, peak-hold, waterfall
 and channel-utilization view. Real utilization is an experimental sampled PHY
-CCA counter ratio, with raw counters and a window-time upper bound exposed in
+CCA counter ratio pooled from up to eight valid, distributed windows per dwell,
+with raw counter sums, valid/attempted counts and window-time bounds exposed in
 tooltips. It is not a whole-dwell average or established MAC/NAV airtime;
 invalid samples remain unavailable rather than becoming invented percentages.
+Each RF snapshot has its complex I/Q mean removed before windowing and FFT to
+suppress the receiver's center-frequency DC component. This also suppresses a
+genuine signal component exactly at the tuned center; see the measurement limits
+in the TLV contract.
 The screenshots below show synthetic Demo data, not measured RF spectra.
 
 - [Firmware build and verification](docs/firmware.md): ESP-IDF v6.0.3 through EIM, Podman or Windows wslc.

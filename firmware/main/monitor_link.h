@@ -64,7 +64,8 @@ bool monitor_link_submit_json(const char *json_body, size_t length_bytes);
  * never a partial frame). */
 bool monitor_link_submit_frame(const MonitorTlvFrame *frame);
 
-/* Wrap a SPECTRUM_RF event (handoff v2.1, type 0x04) using the link's own
+/* Wrap a SPECTRUM_RF event (docs/tlv-protocol.md, type 0x04) using the
+ * link's own
  * persistent frame buffer and enqueue it. Application task only; same
  * drop contract as submit_json (wrap failure or queue-full = whole frame
  * dropped and counted). */

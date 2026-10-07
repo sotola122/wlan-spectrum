@@ -449,6 +449,10 @@ class MainWindow(QMainWindow):
         self.db_max = QSlider(Qt.Orientation.Horizontal)
         self.db_max.setRange(-70, 0)
         self.db_max.setValue(-20)
+        # RF source default: adopt 0 dBFS on transition unless the USER
+        # chose a range (that choice survives every source switch)
+        self._db_max_manual = False
+        self._rf_db_max_preset = self.db_max.value()
         self.db_min = QSlider(Qt.Orientation.Horizontal)
         self.db_min.setRange(-130, -60)
         self.db_min.setValue(-105)
@@ -726,6 +730,7 @@ class MainWindow(QMainWindow):
     def _detach(self) -> None:
         self._cfg_timer.stop()          # no retry may outlive this source
         self._cfg_attempts = 0
+        self._restore_demo_range_default()   # leaving RF: Demo default
         was_serial = self._source_kind == "serial"
         if self.source is not None:
             src, self.source = self.source, None
@@ -983,11 +988,34 @@ class MainWindow(QMainWindow):
         if self._rf_active != was_active:
             if self._rf_active:
                 self._legacy = False   # capability ack supersedes legacy claim
+                self._enter_rf_default_range()
+            else:
+                # status-driven RF clear (_on_monitor_status path): an
+                # untouched range returns to the Demo default
+                self._restore_demo_range_default()
             self._init_display_arrays()
         if old_epoch is not None and self.monitor_state.epoch != old_epoch:
             self._init_display_arrays()   # new epoch: no stale traces
         self._update_acquisition_controls()
         self._update_power_units()
+
+    def _enter_rf_default_range(self) -> None:
+        """Entering the RF source: default the axis upper bound to
+        0 dBFS - only while untouched. A manual choice is never
+        overwritten, and nothing here runs on heartbeats or data."""
+        if self._db_max_manual:
+            return
+        self._rf_db_max_preset = 0
+        self.db_max.setValue(0)   # valueChanged: equal value, not manual
+
+    def _restore_demo_range_default(self) -> None:
+        """Leaving the RF source (demo start, detach, status-driven clear):
+        an untouched range returns to the Demo default (-20); a manual
+        choice is never overwritten."""
+        if self._db_max_manual:
+            return
+        self._rf_db_max_preset = -20
+        self.db_max.setValue(-20)
 
     def _update_dev_label(self, data: dict) -> None:
         st = self.monitor_state
@@ -1059,6 +1087,19 @@ class MainWindow(QMainWindow):
             self.wf_img.setRect(self._wf_rect)
         self._update_peak_column()
 
+    @staticmethod
+    def _util_tooltip(sample: dict | None) -> str:
+        """Raw metadata tooltip for the pooled contract: window_us_upper
+        is the sum of sampled short windows (NEVER the dwell span) with
+        the actual valid/attempted counts."""
+        if sample is None:
+            return ""
+        return (f"Sampled PHY CCA (experimental): busy {sample['busy']} / "
+                f"total {sample['total']} ticks · window_us_upper "
+                f"{sample['window_us_upper']} µs = sum of "
+                f"{sample['samples']} valid of {sample['attempted']} "
+                "attempted sampled windows (not the dwell span)")
+
     def _update_util_bars(self) -> None:
         info = BANDS[self.band]
         xs = [channel_freq(self.band, ch) for ch in info.channels]
@@ -1087,11 +1128,8 @@ class MainWindow(QMainWindow):
                 continue
             if ch in self._util:
                 it.setText(f"{self._util[ch]:.0f} %")
-                sample = self.monitor_state.util_samples.get(ch)
-                it.setToolTip(
-                    f"Sampled PHY CCA (experimental): busy {sample['busy']} / "
-                    f"total {sample['total']} ticks · window_us_upper "
-                    f"{sample['window_us_upper']} µs" if sample else "")
+                it.setToolTip(self._util_tooltip(
+                    self.monitor_state.util_samples.get(ch)))
             else:
                 it.setText("—")
                 it.setToolTip(
@@ -1113,6 +1151,10 @@ class MainWindow(QMainWindow):
 
     # ============================================================ UI helpers
     def _apply_db_range(self) -> None:
+        sender = self.sender()
+        if (sender is self.db_max
+                and self.db_max.value() != self._rf_db_max_preset):
+            self._db_max_manual = True   # user choice: never overwritten
         lo, hi = self.db_min.value(), self.db_max.value()
         unit = self._power_unit()
         self.db_min_lbl.setText(f"{lo} {unit}")
@@ -1153,8 +1195,9 @@ class MainWindow(QMainWindow):
         if self._rf_active and self.monitor_state.utilization_available:
             self.util_card.setToolTip(
                 f"Sampled PHY CCA (experimental) · source={UTIL_SOURCE} · "
-                f"confidence={UTIL_CONFIDENCE} · cell tooltip: raw "
-                "busy/total ticks + window_us_upper µs")
+                f"confidence={UTIL_CONFIDENCE} · window_us_upper µs = SUM "
+                "of sampled short windows (not the dwell span); cells show "
+                "raw busy/total ticks + valid/attempted counts")
         else:
             self.util_card.setToolTip("")
         self._apply_db_range()

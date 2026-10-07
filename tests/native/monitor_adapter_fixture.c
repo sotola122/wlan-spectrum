@@ -345,7 +345,8 @@ static void case_radio_util(void) {
     assert(out.util_window_us_upper > 0u &&
            out.util_window_us_upper <= 5000u);
 
-    /* 3. formatter: EXACT frozen 5 fields, no pairs/busy_frac */
+    /* 3. formatter: current pooled util object — no pairs/busy_frac,
+     * no version key */
     MonitorChannelEvent ev = {.epoch = 1, .cycle = 2, .observation = &out};
     char json[4096];
     size_t n = monitor_format_channel_event(json, sizeof json, &ev);
@@ -447,6 +448,178 @@ static void case_radio_util(void) {
     printf("radio-util ok\n");
 }
 
+/* CURRENT pooled contract (no version key): EIGHT distributed one-shot
+ * windows per dwell, scheduled from ACTUAL elapsed time, at most one
+ * window per tick, missed slots skipped (never burst), and a late tick
+ * close to dwell end arms NOTHING (a window never straddles the dwell). */
+static void case_radio_util_pooled(void) {
+    MonitorObservation out;
+
+    /* 1. constant trace, default 120 ms dwell, real 10 ms tick cadence:
+     * slot0 at begin + one attempt per due tick => exactly8 arms, never
+     * more than one per tick (the expect table IS the no-burst proof). */
+    fake_cca_arm_reset(true);       /* device model: arm clears counters */
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_cca_step(80u, 40u);
+    fake_time_autostep(10u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    const uint32_t expect_after_tick[12] =
+        {1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 8};
+    for (int k = 0; k < 12; k++) {
+        fake_time_advance_us(10000);   /* the app's dwell-wait tick */
+        monitor_radio_cca_tick(120);
+        assert(fake_cca_set_cnt_calls() == expect_after_tick[k]);
+    }
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    monitor_radio_finish(&out);
+    assert(out.util_valid);
+    assert(out.util_samples == 8 && out.util_attempted == 8);
+    assert(out.util_total == 8u * 0x400u);    /* constant trace */
+    assert(out.util_busy > 0u && out.util_busy <= out.util_total);
+    assert(out.util_busy % 8u == 0u);         /* identical windows */
+    assert(out.util_window_us_upper >= out.util_samples &&
+           out.util_window_us_upper <= 5000u * out.util_samples);
+
+    /* 2. formatter: pooled counts present, NO version key. */
+    MonitorChannelEvent ev = {.epoch = 1, .cycle = 1, .observation = &out};
+    char json[4096];
+    size_t n = monitor_format_channel_event(json, sizeof json, &ev);
+    assert(n > 0);
+    assert(strstr(json, "\"samples\":8") != NULL);
+    assert(strstr(json, "\"attempted\":8") != NULL);
+    assert(strstr(json, "\"version\"") == NULL);
+    assert(strstr(json, "\"source\":\"c5_v6.0.3_phy_cca_cnt\"") != NULL);
+    assert(strstr(json, "\"confidence\":\"experimental_sampled\"") != NULL);
+    printf("%s\n", json);            /* host-side pooled decode input */
+
+    /* 3. alternating trace: the second window sees a different B step;
+     * pooled busy is the honest sum of the two different windows. */
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_cca_step(80u, 40u);         /* window A: busy = 13 x 40 = 520 */
+    fake_time_autostep(10u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    fake_cca_step(80u, 60u);         /* window B: busy = 13 x 60 = 780 */
+    fake_time_advance_us(10000);
+    fake_time_advance_us(10000);     /* ~20 ms: slot1 due */
+    monitor_radio_cca_tick(120);
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    monitor_radio_finish(&out);
+    assert(out.util_valid);
+    assert(out.util_samples == 2 && out.util_attempted == 2);
+    assert(out.util_total == 2u * 0x400u);
+    assert(out.util_busy == 520u + 780u);
+
+    /* 4. late-dwell tick: remaining time < window budget -> NO arm
+     * (no straddle), and the lower attempt count is reported honestly. */
+    fake_cca_arm_reset(true);
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_cca_step(80u, 40u);
+    fake_time_autostep(10u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);   /* slot0 = attempt 1 */
+    fake_time_autostep(0u);            /* freeze; control elapsed exactly */
+    fake_time_advance_us(117000u);     /* elapsed 117 ms, remaining 3 ms */
+    uint32_t arms = fake_cca_set_cnt_calls();
+    monitor_radio_cca_tick(120);
+    assert(fake_cca_set_cnt_calls() == arms);       /* nothing armed */
+    monitor_radio_finish(&out);
+    assert(out.util_valid);
+    assert(out.util_attempted == 1 && out.util_samples == 1);
+
+    /* 5. failed begin invalidates everything pooled before it: finish
+     * after a failed begin publishes nothing (stale-window regression). */
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_time_autostep(10u);
+    fake_cca_step(80u, 40u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    fake_wifi_set_channel_result(ESP_ERR_INVALID_STATE);
+    assert(monitor_radio_begin(0, 6) == ESP_ERR_INVALID_STATE);
+    fake_wifi_set_channel_result(ESP_OK);
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    monitor_radio_finish(&out);
+    assert(!out.util_valid);
+
+    /* 6. repeat finish republishes NOTHING and ticks after finish arm
+     * nothing (pool cleared, active gate — stale-sum regression). */
+    fake_cca_arm_reset(true);
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_cca_step(80u, 40u);
+    fake_time_autostep(10u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    monitor_radio_finish(&out);
+    assert(out.util_valid && out.util_attempted == 1);
+    MonitorObservation again;
+    memset(&again, 0, sizeof again);
+    monitor_radio_finish(&again);
+    assert(!again.util_valid);        /* second finish: nothing */
+    arms = fake_cca_set_cnt_calls();
+    fake_time_advance_us(10000);
+    monitor_radio_cca_tick(120);
+    assert(fake_cca_set_cnt_calls() == arms);   /* ticks after finish */
+
+    /* 7. MIXED validity in ONE dwell: valid / invalid / valid ->
+     * samples=2, attempted=3, sums count ONLY the valid windows. The
+     * middle window fails because busy > total (B runs past A). */
+    fake_cca_arm_reset(true);
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_cca_step(80u, 40u);
+    fake_time_autostep(10u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);      /* w1: valid */
+    fake_time_advance_us(10000);
+    monitor_radio_cca_tick(120);      /* ~10 ms: slot0 consumed, skip */
+    fake_cca_step(80u, 200u);      /* w2: busy=13x200=2600 > total=1024 */
+    fake_time_advance_us(10000);
+    monitor_radio_cca_tick(120);      /* ~20 ms: slot1 attempt — INVALID */
+    fake_cca_step(80u, 40u);
+    fake_time_advance_us(10000);
+    monitor_radio_cca_tick(120);      /* ~30 ms: slot2 attempt — valid */
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    monitor_radio_finish(&out);
+    assert(out.util_valid);
+    assert(out.util_samples == 2 && out.util_attempted == 3);
+    assert(out.util_total == 2u * 0x400u);   /* only the two valid ones */
+    assert(out.util_busy == 520u + 520u);
+    assert(out.util_window_us_upper >= out.util_samples &&
+           out.util_window_us_upper <= 5000u * out.util_samples);
+    ev.observation = &out;
+    n = monitor_format_channel_event(json, sizeof json, &ev);
+    assert(n > 0);
+    printf("%s\n", json);            /* second pooled JSON: mixed counts */
+
+    /* 8. LATENCY proof: one tick jumping SEVERAL slots attempts exactly
+     * ONE window (never a catch-up burst), and further ticks inside the
+     * same time slot attempt nothing. */
+    fake_cca_arm_reset(true);
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_cca_step(80u, 40u);
+    fake_time_autostep(10u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);      /* slot 0: 1 arm */
+    arms = fake_cca_set_cnt_calls();
+    fake_time_advance_us(70000);      /* jump ~4 slots at once */
+    monitor_radio_cca_tick(120);
+    assert(fake_cca_set_cnt_calls() == arms + 1u);     /* exactly ONE */
+    monitor_radio_cca_tick(120);      /* same instant: same slot */
+    assert(fake_cca_set_cnt_calls() == arms + 1u);     /* no attempt */
+    fake_time_advance_us(1000);       /* still inside the same slot */
+    monitor_radio_cca_tick(120);
+    assert(fake_cca_set_cnt_calls() == arms + 1u);     /* no attempt */
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    monitor_radio_finish(&out);
+
+    printf("radio-util-pooled ok\n");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);
@@ -486,6 +659,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "radio-util") == 0) {
         case_radio_util();
+        return 0;
+    }
+    if (strcmp(argv[1], "radio-util-pooled") == 0) {
+        case_radio_util_pooled();
         return 0;
     }
     fprintf(stderr, "unknown case: %s\n", argv[1]);

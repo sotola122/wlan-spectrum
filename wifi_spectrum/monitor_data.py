@@ -33,10 +33,14 @@ UTIL_WINDOW_MAX_US = 5000         # arm -> first-done upper bound
 
 
 def parse_channel_util(util) -> dict | None:
-    """Strict validation of the additive STATUS channel ``util`` object.
-    Returns the raw sample, or None for a gap - never clamped, never
-    zero-filled. Known keys must match the contract exactly (bools are not
-    ints); unknown additive keys are tolerated."""
+    """Strict validation of the additive STATUS channel ``util`` object:
+    the single CURRENT pooled contract (no communication versioning).
+    Returns the raw sample with its valid/attempted counts, or None for a
+    gap - never clamped, never zero-filled. Known keys must match the
+    contract exactly (bools are not ints); unknown additive keys are
+    tolerated. Every window contributes >= 1 to both sums, so
+    total/window >= samples; ``samples == 1`` is simply one valid
+    measurement."""
     if not isinstance(util, dict):
         return None
     busy = util.get("busy")
@@ -48,14 +52,21 @@ def parse_channel_util(util) -> dict | None:
     if (util.get("source") != UTIL_SOURCE
             or util.get("confidence") != UTIL_CONFIDENCE):
         return None
-    if total <= 0 or total > UTIL_TOTAL_MAX:
+    samples = util.get("samples")
+    attempted = util.get("attempted")
+    if type(samples) is not int or not 1 <= samples <= 8:
+        return None
+    if type(attempted) is not int or not samples <= attempted <= 8:
         return None
     if busy < 0 or busy > total:    # B > A (incl. +1 endpoint) = invalid
         return None
-    if window <= 0 or window > UTIL_WINDOW_MAX_US:
+    if total < samples or total > samples * UTIL_TOTAL_MAX:
+        return None
+    if window < samples or window > UTIL_WINDOW_MAX_US * samples:
         return None
     return {"source": util["source"], "confidence": util["confidence"],
-            "busy": busy, "total": total, "window_us_upper": window}
+            "busy": busy, "total": total, "samples": samples,
+            "attempted": attempted, "window_us_upper": window}
 
 
 @dataclass(frozen=True)

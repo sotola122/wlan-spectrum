@@ -51,7 +51,7 @@ class Report:
     epoch: int | None = None
     spectrum: bool = False
     utilization: bool = False
-    util_events: int = 0        # valid Sampled PHY CCA samples received
+    util_events: int = 0        # actual valid Sampled PHY CCA sample events
     frames: int = 0
     cycles: int = 0
     caps: dict | None = None
@@ -298,9 +298,9 @@ def evaluate(request: ConfigRequest, events: list[tuple[float, object]], *,
                 # is rejected - never clamped, never counted
                 if parse_channel_util(data.get("util")) is None:
                     rep.fail(f"ch {ch}: invalid util sample (source/"
-                             "confidence/ranges, B<=A, ints only)")
+                             "confidence/counts/ranges, B<=A, ints only)")
                 else:
-                    rep.util_events += 1   # valid zero-busy counts here
+                    rep.util_events += 1   # actual valid sample event
             open_cycle(cid)       # a channel STATUS alone is NOT RF coverage
             if first_reported is None:
                 first_reported = ch
@@ -398,7 +398,8 @@ def finalize(rep: Report, *, tlv_errors: int, ack_errors: int,
             rep.notes.append(f"util_samples={rep.util_events}")
         if rep.utilization and rep.util_events == 0:
             # capability advertised but no valid sample ever arrived:
-            # absence is a gap, never fake coverage
+            # absence is a gap, never fake coverage - the acceptance gate
+            # demands actual valid sample events under the current contract
             rep.fail("no valid utilization samples received (zero util)")
         if rep.tx_dropped:
             rep.notes.append(f"tx_dropped={rep.tx_dropped}")
@@ -561,11 +562,13 @@ def _full_cycle(request: ConfigRequest, epoch: int = 1, cycle: int = 1,
         _cycle(epoch, cycle, request.band)]
 
 
-def _util_sample(busy: int, total: int = 65536, window: int = 819,
+def _util_sample(busy: int, total: int = 65536, samples: int = 3,
+                 attempted: int = 4, window: int = 819,
                  **over) -> dict:
-    """Contract-legal Sampled PHY CCA sample (over: fault injection)."""
+    """Contract-legal pooled util sample (over: fault injection)."""
     d = {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
-         "busy": busy, "total": total, "window_us_upper": window}
+         "busy": busy, "total": total, "samples": samples,
+         "attempted": attempted, "window_us_upper": window}
     d.update(over)
     return d
 
@@ -743,6 +746,28 @@ def self_test_cases() -> list[tuple[str, list[bytes], ConfigRequest, bool,
          [_util_cap_ack(live)]
          + _full_cycle(live, util=_util_sample(65537)), live, False,
          "invalid util sample"),
+        ("util-pooled-samples-accepted",
+         [_util_cap_ack(live)]
+         + _full_cycle(live, util=_util_sample(100, 40000)), live,
+         True, None),
+        ("util-sample-count-out-of-range-fails",
+         [_util_cap_ack(live)]
+         + _full_cycle(live, util=_util_sample(100, samples=9)), live,
+         False, "invalid util sample"),
+        ("util-attempted-below-samples-fails",
+         [_util_cap_ack(live)]
+         + _full_cycle(live, util=_util_sample(100, attempted=2)), live,
+         False, "invalid util sample"),
+        ("util-window-sum-over-budget-fails",
+         [_util_cap_ack(live)]
+         + _full_cycle(live, util=_util_sample(100, window=15001)),
+         live, False, "invalid util sample"),
+        ("util-total-over-mask-sum-fails",
+         [_util_cap_ack(live)]
+         + _full_cycle(live,
+                       util=_util_sample(100,
+                                          total=3 * 0x07FFFFFF + 1)),
+         live, False, "invalid util sample"),
         ("caps-inconsistent-with-effective",
          [_cfg_bytes(live, 1, spectrum=True, spectrum_caps=RF_CAPS,
                      spectrum_effective={"fft_size": 1024,

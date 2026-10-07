@@ -166,13 +166,28 @@ bool monitor_spectrum_power_dbfs(const uint32_t *iq_words, uint16_t fft_size,
      * cancel over a full period), so W is computed analytically. */
     float window_sum = (float)fft_size / 2.0f;
     float inv_w = 1.0f / window_sum;
+    /* Per-capture DC removal: subtract this capture's own mean I and mean
+     * Q BEFORE the Hann window. LIMITATION: a true signal exactly at the
+     * tuned centre is removed together with the offset — subtraction only,
+     * no power notch, no interpolation, no absolute offset, no calibrated
+     * claim. Sample sums are exact in float32 (<= 1024 x 512) and every
+     * supported size is a power of two, so the division is exact. The
+     * evidence for this behaviour lives in the report, not here. */
+    float sum_i = 0.0f;
+    float sum_q = 0.0f;
+    for (uint16_t n = 0; n < fft_size; n++) {
+        sum_i += (float)sign_extend_10(iq_words[n]);
+        sum_q += (float)sign_extend_10(iq_words[n] >> 10);
+    }
+    float mean_i = sum_i / (float)fft_size;
+    float mean_q = sum_q / (float)fft_size;
     for (uint16_t n = 0; n < fft_size; n++) {
         float w = 0.5f * (1.0f - cosf(2.0f * SPECTRUM_PI_F * (float)n /
                                        (float)fft_size));
         int32_t i_raw = sign_extend_10(iq_words[n]);
         int32_t q_raw = sign_extend_10(iq_words[n] >> 10);
-        g_work[2u * n] = ((float)i_raw / IQ_FULL_SCALE) * w;
-        g_work[2u * n + 1u] = ((float)q_raw / IQ_FULL_SCALE) * w;
+        g_work[2u * n] = (((float)i_raw - mean_i) / IQ_FULL_SCALE) * w;
+        g_work[2u * n + 1u] = (((float)q_raw - mean_q) / IQ_FULL_SCALE) * w;
     }
     run_fft(fft_size);
     uint16_t shift = (uint16_t)(fft_size >> 1);
@@ -185,7 +200,7 @@ bool monitor_spectrum_power_dbfs(const uint32_t *iq_words, uint16_t fft_size,
                                                         : POWER_FLOOR);
         if (!isfinite(dbfs)) {
             /* Broken input or math: fail the whole frame instead of
-             * publishing fabricated bins (handoff missing semantics). */
+             * publishing fabricated bins (docs/tlv-protocol.md). */
             return false;
         }
         long centi = lroundf(dbfs * 100.0f);
