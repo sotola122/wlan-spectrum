@@ -1,19 +1,29 @@
-# ESP32-C5 Wi-Fi Monitor and Spectrum Demo
+# ESP32-C5 Wi-Fi Spectrum Monitor
 
 ESP32-C5 firmware and a desktop GUI (PySide6 + pyqtgraph) for dual-band
-(2.4 / 5 GHz) Wi-Fi monitoring. The real device reports AP sightings,
-received-frame RSSI and packet activity over the board's USB-UART bridge using
-CRC32-protected TLV frames. It does not produce an RF FFT or CCA utilization.
-A separate **demo (mock) mode** generates synthetic spectrum/waterfall plots
-without hardware; the screenshots below show Demo, not measured RF spectra.
+(2.4 / 5 GHz) Wi-Fi monitoring. The real device captures raw I/Q snapshots,
+computes FFT power, and sends it over the board's USB-UART bridge using
+CRC32-protected TLV frames. Real spectra use relative **dBFS**, not calibrated
+antenna-input dBm. Packet RSSI and AP sightings are separate protocol observations.
+Real and **Demo (mock)** sources use the same spectrum, peak-hold, waterfall
+and channel-utilization view. Real utilization is an experimental sampled PHY
+CCA counter ratio, with raw counters and a window-time upper bound exposed in
+tooltips. It is not a whole-dwell average or established MAC/NAV airtime;
+invalid samples remain unavailable rather than becoming invented percentages.
+The screenshots below show synthetic Demo data, not measured RF spectra.
 
 - [Firmware build and verification](docs/firmware.md): ESP-IDF v6.0.3 through EIM, Podman or Windows wslc.
 - [Real monitor events and measurement semantics](docs/wifi-monitor.md).
 - [TLV framing, CRC32 and CONFIG](docs/tlv-protocol.md).
 
-EIM/Podman builds, USB-UART programming, both-band reception and a ten-minute
-stream have been exercised. Windows wslc and full qualification remain pending;
-see the firmware workflow for current limitations.
+The RF and sampled-CCA firmware passed EIM/Podman builds, USB-UART programming,
+Live/Sweep checks on both bands, separate ten-minute streams on each band, and
+the physical-device GUI harness on Linux (offscreen). The GUI test includes
+both-band waterfall history, measured utilization, configuration changes,
+pause, finite sweep count and reconnect. The combined suite passed 226 tests.
+See the firmware workflow for revision-specific acceptance results and transport
+limitations. Windows validation is performed separately; these Linux tests do
+not establish Windows operation or calibrated RF accuracy.
 
 ![2.4 GHz live](docs/screenshot_cursor_24.png)
 ![5 GHz band sweep](docs/screenshot_cursor_5.png)
@@ -102,19 +112,17 @@ On Windows, use demo mode instead (`uv run wifi-spectrum --demo`, or the **Demo*
 
 ## UI
 
-The real-device view shows channel-center RSSI points, received packets/s,
-channel observations and AP sightings. It displays effective dwell/cycle timing
-and drop counters; unavailable observations appear as `—`.
-FFT, sample-rate, spectrum peak-hold and waterfall controls are disabled in
-that view. Live updates each channel, while Sweep publishes cycle observations.
-
-The following plot layout is for **Demo**:
+Real RF and Demo share the following layout. Real RF uses dBFS, advertises
+supported FFT sizes/sample rates, and shows sampled PHY CCA percentages where
+valid. Missing utilization remains `—`.
+Live updates each channel snapshot; Sweep publishes at the explicit device
+cycle marker. Missing capture regions are gaps rather than a generated floor.
 
 | Area | Contents |
 |---|---|
 | Top bar | Live / Band Sweep segmented control, 2.4 GHz / 5 GHz, ▶ Start / Pause, Sweep time (ms), Count (0 = ∞) + progress, Demo, COM port / ⟳ / baud / Connect |
-| Left (shared X axis, MHz) | 1. Spectrum — blue current + orange peak hold (dBm), channel markers, hover readout · 2. Waterfall (blue→lavender→peach→gold map, newest row on top) · 3. Channel Utilization bar chart (%) with channel numbers |
-| Right panel | Channels (CH / MHz / Util / Peak; click a row to zoom), Show Full Band, FFT size & Sample rate (placeholders, RBW shown), Peak Hold / Waterfall / Channel Display toggles, Reset Peak, dB Range sliders (Max/Min – spectrum Y range and waterfall colour levels), Status (link, bytes, fps, TLV errors, last device status) |
+| Left (shared X axis, MHz) | 1. Spectrum — blue current + orange peak hold (real dBFS / Demo dBm), channel markers, hover readout · 2. Waterfall (blue→lavender→peach→gold map, newest row on top) · 3. Channel Utilization (generated % in Demo; experimental sampled PHY CCA % on the real device) |
+| Right panel | Channels (CH / MHz / Util / Peak; click a row to zoom), Show Full Band, FFT size & Sample rate (real acquisition settings; nominal bin spacing shown as RBW), Peak Hold / Waterfall / Channel Display toggles, Reset Peak, dB Range sliders, Status (link, bytes, fps, TLV errors, device capabilities and drops) |
 
 Mouse wheel / drag zooms and pans the frequency axis on all three plots together.
 
@@ -130,6 +138,7 @@ Field layouts, resync rules, and byte examples: [`docs/tlv-protocol.md`](docs/tl
 | `0x01` SPECTRUM | Demo→PC | `f_start_mhz f32, f_step_mhz f32, n u16, n × int16 (dBm×100)` |
 | `0x02` CH_UTIL | Demo→PC | `band u8 (0=2.4, 1=5), n u8, n × (ch u8, util_pct u8)` |
 | `0x03` STATUS | dev→PC | Real firmware: `wifi-monitor/1` JSON events. Codec also supports Demo JSON and binary status. |
+| `0x04` SPECTRUM_RF | dev→PC | Epoch/cycle, band/channel/mode, rate code, FFT size/source, center/span in kHz, then int16 dBFS×100 bins |
 | `0x10` CONFIG | PC→dev | `mode u8 (0=live,1=sweep), band u8, sweep_ms u16, fft_size u16, sample_rate_khz u32` |
 
 * Demo spectrum frames may cover the whole band (live) or a segment (sweep); the GUI
@@ -149,7 +158,6 @@ wifi_spectrum/
   __main__.py     entry point (wifi-spectrum / python -m wifi_spectrum [--demo])
   main_window.py  window, plot cards, panels, segmented controls
   monitor_data.py real-device event validation, epoch/cycle and AP state
-  monitor_widget.py measured RSSI, packet-rate and AP/channel views
   theme.py        DESIGN.md tokens, Qt stylesheet, plot styling, colormaps
   assets/         small SVG glyphs (checkbox tick, chevrons) used by the stylesheet
   tlv.py          TLV encode/decode + incremental stream parser
@@ -163,8 +171,10 @@ wifi_spectrum/
 * Every frame has CRC32 but no sync word. Plausible false headers can delay
   recovery until more bytes arrive; byte-bounded buffering does not guarantee
   recovery within a fixed time on a stopped stream.
-* Real firmware validates and echoes FFT size/sample rate but cannot acquire
-  raw RF FFT data. Spectrum/waterfall and utilization plots are Demo-only.
+* Raw I/Q capture uses a private PHY entry point pinned to ESP-IDF v6.0.3.
+  It is a sequence of snapshots, not continuous whole-band acquisition.
+  dBFS is not calibrated dBm; gain, frequency response and absolute RF accuracy
+  are unqualified. CCA utilization remains unavailable.
 * Mock data is synthetic (OFDM-like masks, duty-cycled APs, BT hops, microwave
   hump), not a model of real ESP32-C5 CSI/RSSI measurements.
 * The real JP receive allowlist differs from the Demo grid; see the monitor

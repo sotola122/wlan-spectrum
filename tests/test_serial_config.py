@@ -12,10 +12,11 @@ import contextlib
 import os
 import time
 import unittest
+from unittest import mock
 
 from PySide6.QtWidgets import QApplication
 
-from wifi_spectrum import tlv
+from wifi_spectrum import main_window, tlv
 from wifi_spectrum.main_window import MainWindow
 from wifi_spectrum.serial_link import SerialReader
 
@@ -79,7 +80,11 @@ class SerialOpenConfigTests(unittest.TestCase):
             except OSError:
                 break               # no slave attached yet (EIO on PTYs)
 
+    @mock.patch.object(main_window, "CFG_RETRY_MS", 60000)
     def test_nondefault_config_sent_once_after_open(self) -> None:
+        # The bounded resend (CFG_RETRY_MS) is disabled here to keep this
+        # test's exact-frame intent; recovery is covered by
+        # test_boot_race_dropped_first_config_recovers.
         win = MainWindow()
         win.port_combo.setCurrentText(self.slave_path)
         win.mode_tabs.setCurrentIndex(1)          # Sweep
@@ -126,6 +131,56 @@ class SerialOpenConfigTests(unittest.TestCase):
             win.connect_btn.setChecked(False)
             win._detach()
             win.close()
+
+    @mock.patch.object(main_window, "CFG_RETRY_MS", 30)
+    def test_boot_race_dropped_first_config_recovers(self) -> None:
+        """mock HW boot over a real PTY: the device drops the very first
+        CONFIG (UART still coming up); the bounded idempotent resend must
+        deliver a fresh matching ack, then the chain must be cancelled."""
+        import select
+        import threading
+
+        from tests.test_monitor_widget import config_event
+
+        win = MainWindow()
+        win.port_combo.setCurrentText(self.slave_path)
+        parser = tlv.TlvParser()
+        seen: list[dict] = []
+        stop = threading.Event()
+
+        def device() -> None:
+            while not stop.is_set():
+                ready, _, _ = select.select([self.master], [], [], 0.05)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(self.master, 4096)
+                except OSError:
+                    time.sleep(0.02)     # no slave yet (EIO on the master)
+                    continue
+                for msg in parser.feed(chunk):
+                    if isinstance(msg, dict):
+                        seen.append(msg)
+                        if len(seen) >= 2:   # CONFIG #1 is "lost" in boot
+                            os.write(
+                                self.master,
+                                tlv.encode_status_json(config_event(**msg)))
+
+        th = threading.Thread(target=device, daemon=True)
+        th.start()
+        try:
+            win.connect_btn.setChecked(True)
+            self.assertTrue(spin_until(lambda: win.monitor_state.ready, 5.0),
+                            "no matching ack after the bounded resend")
+            self.assertGreaterEqual(len(seen), 2)
+            self.assertFalse(win._cfg_timer.isActive(),
+                             "retry chain must be cancelled by the ack")
+        finally:
+            stop.set()
+            win.connect_btn.setChecked(False)
+            win._detach()
+            win.close()
+            th.join(1.0)
 
     def test_detach_disconnects_opened_callback(self) -> None:
         class Recorder:

@@ -5,11 +5,12 @@ The codec is implemented in `wifi_spectrum/tlv.py`; the firmware is in
 `firmware/main/`. Every frame requires CRC32, including Demo frames.
 Old CRC-less senders are incompatible.
 
-Real firmware reports AP sightings, received-frame RSSI and packet counts
-through STATUS JSON, documented in [Wi-Fi monitor events](wifi-monitor.md).
-SPECTRUM, CH_UTIL and binary STATUS remain codec/Demo formats, not measurements
-produced by this firmware. The display grids and spectrum sweep heuristics
-below apply to Demo; real monitoring uses explicit channels and cycle events.
+Measurement metadata uses STATUS JSON, documented in
+[Wi-Fi monitor events](wifi-monitor.md). The additive SPECTRUM_RF format below
+carries snapshot FFT power in dBFS, separately from the legacy SPECTRUM dBm
+format used by Demo. Source capabilities distinguish packet-only monitoring
+from RF acquisition. Demo's frequency-end sweep heuristic does not apply to
+RF acquisition, which uses explicit configuration epochs and cycle events.
 
 ## 1. Overview
 
@@ -28,12 +29,13 @@ binary32 fields are little-endian.
 | Direction | Types | Who sends them in this repo |
 |---|---|---|
 | Device → PC | `0x03` STATUS | Real firmware: `wifi-monitor/1` JSON events. |
+| Device → PC | `0x04` SPECTRUM_RF | Raw-I/Q snapshot FFT when advertised by the device's STATUS capabilities. |
 | Demo → PC | `0x01` SPECTRUM, `0x02` CH_UTIL, `0x03` STATUS | `MockDevice.tick` (demo and `--pty`). `SerialReader` forwards these types to the GUI. |
 | PC → device | `0x10` CONFIG | `MainWindow._send_config` on connect and whenever mode, band, sweep time, FFT size, or sample rate changes. |
 
-The same `TlvParser` accepts all four types on either path. `SerialReader`
-discards a decoded CONFIG (it only forwards `Spectrum`, `ChannelUtil`, and
-`Status`). The mock applies a decoded CONFIG dict in `MockDevice.handle_rx`.
+The same `TlvParser` accepts the known message types on either path.
+`SerialReader` discards a decoded CONFIG and forwards measurement and status
+messages. The mock applies a decoded CONFIG dict in `MockDevice.handle_rx`.
 
 ## 2. Frame layout
 
@@ -69,6 +71,7 @@ Known type codes (`KNOWN_TYPES`):
 | `0x01` | SPECTRUM | `<ffH` header, then `n` × `<h` | `10 + 2n` |
 | `0x02` | CH_UTIL | `u8 band, u8 n`, then `n` × `(u8 ch, u8 util_pct)` | `2 + 2n` |
 | `0x03` | STATUS | UTF-8 JSON object, or `<BBIIb` | JSON length, or `11` |
+| `0x04` | SPECTRUM_RF | `<IIBBBBHHII` header, then `n` × `<h` | `24 + 2n` |
 | `0x10` | CONFIG | `<BBHHI` | `10` |
 
 Any other type code is unknown. Payload length must be `≤ 8192`
@@ -77,7 +80,7 @@ waited for.
 
 ## 3. Message types
 
-### 3.1 `0x01` SPECTRUM (device → PC)
+### 3.1 `0x01` SPECTRUM (Demo / legacy source → PC)
 
 Power spectrum trace in dBm.
 
@@ -110,7 +113,7 @@ A spectrum frame may be a full-band live trace or one segment of a sweep. The
 wire format does not carry a segment index; the GUI infers end-of-sweep from
 the frequencies (section 5).
 
-### 3.2 `0x02` CH_UTIL (device → PC)
+### 3.2 `0x02` CH_UTIL (Demo / utilization-capable source → PC)
 
 Per-channel airtime / utilization, percent.
 
@@ -211,11 +214,86 @@ not follow those two fields.
 frame. Decode returns a plain dict with keys `mode`, `band`, `sweep_ms`,
 `fft_size`, `sample_rate_khz`.
 
-Demo shows a resolution bandwidth of `sample_rate_khz / fft_size` kHz.
-Real firmware only validates and echoes the FFT/rate fields; it does not
-produce an FFT, sample raw RF at that rate, or measure an RF bandwidth.
-The real view disables those controls and displays RBW as unavailable.
+Demo shows a nominal bin spacing of `sample_rate_khz / fft_size` kHz.
+Packet-only firmware validates and echoes these fields without performing
+an RF FFT. An RF-capable device advertises its supported and effective values
+in STATUS; an echoed request alone is not evidence of the effective sample
+rate. For RF frames, bin spacing is `span_khz / fft_size`. Hann-window noise
+bandwidth is distinct from this bin spacing.
 See [Wi-Fi monitor events](wifi-monitor.md) for CONFIG application and acknowledgement.
+
+### 3.5 `0x04` SPECTRUM_RF (device → PC)
+
+This message carries FFT power from a raw-I/Q snapshot, not a spectrum
+estimated from packet RSSI. Its units are dBFS, not calibrated input dBm.
+The common CRC32 trailer is outside the payload.
+
+| Offset | Field | Type | Meaning |
+|---|---|---|---|
+| 0 | `epoch` | u32 | Applied CONFIG generation |
+| 4 | `cycle` | u32 | Channel traversal identifier |
+| 8 | `band` | u8 | `0` = 2.4 GHz, `1` = 5 GHz |
+| 9 | `channel` | u8 | Receive channel for this snapshot |
+| 10 | `mode` | u8 | `0` = Live, `1` = Sweep |
+| 11 | `rate_code` | u8 | Matches a capability entry's `code`, not its array position |
+| 12 | `fft_size` | u16 | Even number of bins, `n` |
+| 14 | `source` | u16 | `0` = C5 snapshot I/Q FFT; other values unsupported |
+| 16 | `center_khz` | u32 | Tuned center frequency of this frame, kHz |
+| 20 | `span_khz` | u32 | Full sample-rate span, kHz; 20 MS/s is `20000` |
+| 24 | `power_dbfs[i]` | i16 × `n` | Bin power in 0.01 dBFS steps |
+
+Payload length is exactly `24 + 2*n`, within the firmware's 4096-byte payload
+bound. Bin order is FFT-shifted, from low to high frequency:
+
+```
+frequency_khz(i) = center_khz - span_khz/2 + i*span_khz/n
+```
+
+The lower edge is included; the upper edge is excluded. DC is at `i=n/2`.
+Each frame's center is authoritative because acquisition hops channels; a
+single CONFIG-level center cannot describe an entire traversal.
+
+Power uses a full-scale complex-I/Q reference and a periodic Hann window:
+`X = FFT(x*w)`, `W = sum(w)`, `P = abs(X)^2/W^2`, and `dBFS = 10*log10(P)`.
+A unit-amplitude complex tone on a bin center is 0 dBFS. There is no extra
+factor of four from a real-signal, one-sided spectrum convention. Integer
+encoding rounds `100*dBFS` and clamps to int16. Missing captures are absent
+frames, not fabricated floor samples; spectral background is not calibrated
+antenna-input noise power.
+
+STATUS `config` advertises `spectrum`, optional `spectrum_caps` with
+`source`, `fft_sizes`, `rate_codes` (`code`, `span_khz`), and
+`bin_unit: "centi_dbfs"`. `spectrum_effective` supplies the active
+`fft_size`, `rate_code`, and `span_khz`. Capability values are device-reported;
+the GUI must not infer hardware support from the CONFIG echo alone.
+
+The matching CONFIG acknowledgement precedes RF data from a new epoch.
+Within a cycle, the channel STATUS precedes its RF frame; the cycle STATUS
+follows all channel frames. Live publishes accepted frames as they arrive;
+Sweep publishes at the cycle marker. Frames from stale epochs or already
+completed cycles must not restore old measurements. A missing capture or
+lost cycle marker must not carry an old spectrum into a later cycle.
+
+Channel utilization remains a separate measurement. An unavailable source
+is reported as `utilization.available: false` with a blocker string, not as
+zero utilization. Neither packets/s nor spectral power is silently relabelled
+as a CCA busy-time percentage.
+The pinned C5 implementation carries experimental sampled PHY CCA counters
+in the optional STATUS `channel.util` object, using the same channel-event
+epoch and cycle. See [sampled PHY CCA](wifi-monitor.md#sampled-phy-cca) for its
+raw counters, validity rules and window-time upper bound. It does not reuse
+Demo's `0x02 CH_UTIL` frames or claim whole-dwell airtime coverage.
+
+An independent codec fixture (eight bins for the wire-format test, not a
+claim of hardware FFT support) uses epoch 1, cycle 0, band 0, channel 1,
+mode 0, rate code 0, source 0, center 2412000 kHz, span 20000 kHz, and
+bins `[0, -100, -200, -300, -400, -500, -600, -700]` in centi-dBFS:
+
+```
+04280001000000000000000001000008000000e0cd2400204e000000009cff38ffd4fe70fe0cfea8fd44fd9f7a8723
+```
+
+This frame is 47 bytes; its CRC32 is `0x23877a9f`, encoded `9f 7a 87 23`.
 
 ## 4. Stream parsing and resync
 
@@ -225,20 +303,22 @@ finish. Bytes that are not yet a full frame stay in the parser buffer.
 A candidate header is 3 bytes. From a buffer of at least 3 bytes the parser:
 
 1. Reads `type` and `length`.
-2. If `type` is not one of `0x01`, `0x02`, `0x03`, `0x10`, or `length > 8192`,
+2. If `type` is not one of `0x01`, `0x02`, `0x03`, `0x04`, `0x10`, or `length > 8192`,
    it deletes the first buffer byte, adds 1 to `errors`, and tries again.
    It also rejects impossible type-specific lengths: CONFIG must be 10 bytes,
    SPECTRUM must be at least 10 with an even number of sample bytes, and
    CH_UTIL must be at least 2 with an even number of entry bytes.
+   SPECTRUM_RF must be 28–4096 bytes with `(length - 24) % 4 == 0`.
 3. If the buffer holds the header but not all payload and checksum bytes, it stops
    and waits for a later `feed` call unless a received fixed prefix already
    contradicts the length: SPECTRUM declares its sample count in payload bytes
-   8–9; CH_UTIL declares its entry count in payload byte 1.
+   8–9; CH_UTIL declares its entry count in payload byte 1; SPECTRUM_RF
+   declares its bin count in payload bytes 12–13, requiring `length == 24 + 2*n`.
    Contradictory prefixes take the one-byte discard path; valid fragments remain buffered.
 4. It verifies CRC32 over the header and payload. A mismatch drops one byte,
    increments `errors`, and retries without decoding the payload.
    A valid checksum permits decoding. Success consumes `7 + length` bytes and appends the
-   message. `Spectrum`, `ChannelUtil`, and `Status` are objects; CONFIG is a
+   message. `Spectrum`, `SpectrumRf`, `ChannelUtil`, and `Status` are objects; CONFIG is a
    `dict`.
 5. Decode failure drops the first byte only, adds 1 to `errors`, and retries.
    The exception types that count as failure are `ValueError`,
@@ -262,6 +342,7 @@ Concrete decode failures that take the one-byte path:
 | Type | Failure |
 |---|---|
 | SPECTRUM | Payload shorter than 10 bytes, or `len(payload) != 10 + 2n` |
+| SPECTRUM_RF | Short header; zero, odd or oversized bin count; inconsistent length; invalid band/mode/channel; unknown source; non-positive span |
 | CH_UTIL | Payload shorter than 2 bytes, or `len(payload) != 2 + 2n` |
 | STATUS JSON | First byte is `{` but the payload is not a single UTF-8 JSON value |
 | STATUS binary | First byte is not `{` and the payload is not exactly 11 bytes |
@@ -318,7 +399,7 @@ Sweep mode (`mode = 1`):
 With the GUI defaults (20 MS/s, FFT 64) each sweep segment is 20 MHz wide with
 a 0.3125 MHz step, on both bands.
 
-### End-of-sweep heuristic
+### Demo end-of-sweep heuristic
 
 Sweep completeness is decided in the GUI, from the frequencies inside the
 SPECTRUM frame. In live mode every accepted frame appends one waterfall row.
@@ -353,10 +434,11 @@ These are the limits already called out for this prototype.
   failure drop a single byte.
 - **Demo end of sweep is a frequency heuristic.** SPECTRUM has no last-segment
   field. Real monitoring instead uses explicit `epoch` and `cycle` events.
-- **FFT size and sample rate are placeholders.** They travel in CONFIG, the GUI
-  uses them for the on-screen RBW label, and the mock follows them in sweep
-  mode. They do not change the mock’s live-mode bin grid. Real firmware
-  validates and echoes them without performing RF FFT acquisition.
+- **Demo Live does not use the acquisition controls for its bin grid.**
+  The mock follows FFT size/sample rate in Sweep mode, not its Live grid.
+  Real RF firmware uses these controls for snapshot acquisition and reports
+  effective values. The GUI's RBW label is nominal bin spacing, not calibrated
+  receiver resolution or Hann-window noise bandwidth.
 - **Pause is local.** The PC drops SPECTRUM and CH_UTIL while paused. The
   device keeps sending.
 - **Demo 5 GHz coverage stops at UNII-3.** The channel list is 36–177 at 20 MHz

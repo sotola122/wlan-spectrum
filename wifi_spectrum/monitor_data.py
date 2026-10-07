@@ -17,10 +17,45 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .tlv import SpectrumRf
+
 SCHEMA = "wifi-monitor/1"
 MAX_OBSERVATION_APS = 8
 MAX_TRACKED_APS = 256            # GUI AP table bound
 AP_MAX_AGE_SECONDS = 30.0        # sightings older than this are dropped
+
+# Sampled PHY CCA contract (STATUS channel `util` + capability metadata).
+# Experimental sampled measurement - NOT NAV and not dwell-equivalent.
+UTIL_SOURCE = "c5_v6.0.3_phy_cca_cnt"
+UTIL_CONFIDENCE = "experimental_sampled"
+UTIL_TOTAL_MAX = 0x07ffffff       # raw A is a 27-bit counter field
+UTIL_WINDOW_MAX_US = 5000         # arm -> first-done upper bound
+
+
+def parse_channel_util(util) -> dict | None:
+    """Strict validation of the additive STATUS channel ``util`` object.
+    Returns the raw sample, or None for a gap - never clamped, never
+    zero-filled. Known keys must match the contract exactly (bools are not
+    ints); unknown additive keys are tolerated."""
+    if not isinstance(util, dict):
+        return None
+    busy = util.get("busy")
+    total = util.get("total")
+    window = util.get("window_us_upper")
+    if (type(busy) is not int or type(total) is not int
+            or type(window) is not int):
+        return None                 # bools are not ints either
+    if (util.get("source") != UTIL_SOURCE
+            or util.get("confidence") != UTIL_CONFIDENCE):
+        return None
+    if total <= 0 or total > UTIL_TOTAL_MAX:
+        return None
+    if busy < 0 or busy > total:    # B > A (incl. +1 endpoint) = invalid
+        return None
+    if window <= 0 or window > UTIL_WINDOW_MAX_US:
+        return None
+    return {"source": util["source"], "confidence": util["confidence"],
+            "busy": busy, "total": total, "window_us_upper": window}
 
 
 @dataclass(frozen=True)
@@ -117,6 +152,24 @@ class MonitorState:
         self.unavailable: set[int] = set()
         self.elapsed_ms: int | None = None
         self.uptime_ms: int | None = None
+        # RF spectrum capabilities from the config ack (handoff v2 section 5)
+        self.spectrum = False
+        self.spectrum_caps: dict | None = None
+        self.spectrum_effective: dict | None = None
+        self.utilization_available = False
+        self.util_samples: dict[int, dict] = {}   # ch -> published util
+        self.util_stage: dict[int, dict] = {}     # cycle stage, bounded
+        self._util_stage_cycle: int | None = None
+        self.rf_stage: dict[int, SpectrumRf] = {}
+        self.rf_flushed: list[SpectrumRf] = []
+        self._rf_stage_cycle: int | None = None
+
+    @property
+    def rf_ready(self) -> bool:
+        """True while a valid capability ack is current: RF frames are
+        accepted and the spectrum UI may bind to the advertised caps."""
+        return (self.spectrum and self.spectrum_caps is not None
+                and self.spectrum_effective is not None)
 
     # ------------------------------------------------------------ incoming
     def accept(self, data: dict) -> bool:
@@ -139,16 +192,40 @@ class MonitorState:
         raise ValueError(f"unknown monitor event: {event!r}")
 
     def _measurement_epoch_ok(self, data: dict) -> bool:
+        epoch = data.get("epoch")
+        band = data.get("band")
+        if type(epoch) is not int or type(band) is not int:
+            return False          # bools are not ints (True == 1 trap)
         if not self.ready or self.epoch is None:
             return False
-        if data.get("epoch") != self.epoch:
+        if epoch != self.epoch:
             return False
-        return data.get("band") == self.band
+        return band == self.band
+
+    def _util_scope(self, cycle: int) -> bool:
+        """Bind util staging to ONE cycle id. A newer cycle starts a fresh
+        scope (a lost marker can never mix cycles), an older event touches
+        nothing. The stage is a dict keyed by channel, so it stays bounded
+        by the advertised channel list."""
+        if self._util_stage_cycle is None:
+            self._util_stage_cycle = cycle
+            return True
+        if cycle > self._util_stage_cycle:
+            self.util_stage.clear()
+            if self.mode == 0:          # LIVE invalidates at a new cycle;
+                self.util_samples.clear()   # SWEEP keeps its published
+                # snapshot untouched until the matching marker
+            self._util_stage_cycle = cycle
+            return True
+        return cycle == self._util_stage_cycle
 
     def _clear_measurements(self) -> None:
         self.displayed.clear()
         self.staging.clear()
         self._staging_cycle = None
+        self.rf_stage.clear()
+        self.rf_flushed = []
+        self._rf_stage_cycle = None
         self.aps.clear()
         self.cycles = 0
         self._last_cycle = None
@@ -156,6 +233,9 @@ class MonitorState:
         self._coverage_cycle = None
         self.ap_dropped = 0
         self.unavailable.clear()
+        self.util_samples.clear()   # no utilization across an epoch/band
+        self.util_stage.clear()
+        self._util_stage_cycle = None
         self.elapsed_ms = None
 
     def _accept_config(self, data: dict) -> bool:
@@ -182,7 +262,119 @@ class MonitorState:
         tx_dropped = data.get("tx_dropped", 0)
         if type(tx_dropped) is int and tx_dropped >= 0:
             self.tx_dropped = tx_dropped
+        spec = data.get("spectrum")
+        self.spectrum = type(spec) is bool and spec
+        caps, effective = (self._parse_spectrum(data) if self.spectrum
+                           else (None, None))
+        self.spectrum_caps = caps
+        self.spectrum_effective = effective
+        avail = (util.get("available")
+                 if isinstance((util := data.get("utilization")), dict)
+                 else None)
+        # capability gate: known source + exact confidence metadata (unknown
+        # additive keys tolerated, wrong/missing known metadata not)
+        self.utilization_available = (
+            type(avail) is bool and avail and isinstance(util, dict)
+            and util.get("source") == UTIL_SOURCE
+            and util.get("confidence") == UTIL_CONFIDENCE)
+        if not self.utilization_available:
+            # capability lost or provenance broken (even at the SAME epoch):
+            # gap everything - no metadata without a proven capability.
+            # The cycle HIGH-WATER mark (_util_stage_cycle) intentionally
+            # SURVIVES: late older-cycle events still cannot re-seed.
+            self.util_samples.clear()
+            self.util_stage.clear()
         return True
+
+    def _parse_spectrum(self, data: dict) -> tuple[dict | None, dict | None]:
+        """Validate the additive RF capability keys (handoff v2 section 5).
+        Fail-closed: any missing, malformed, or mutually inconsistent field
+        disables the RF path entirely instead of guessing, while the config
+        ack itself stays valid. Called only for a strictly-true
+        ``spectrum`` flag."""
+        caps = data.get("spectrum_caps")
+        eff = data.get("spectrum_effective")
+        if not isinstance(caps, dict) or not isinstance(eff, dict):
+            return None, None
+        if caps.get("bin_unit") != "centi_dbfs":
+            # wrong unit declaration: no conversion exists, reject closed
+            return None, None
+        sizes = caps.get("fft_sizes")
+        rates = caps.get("rate_codes")
+        if not isinstance(sizes, list) or not sizes or \
+                not all(type(s) is int and s > 0 for s in sizes):
+            return None, None
+        if not isinstance(rates, list) or not rates:
+            return None, None
+        spans: dict[int, int] = {}
+        for entry in rates:
+            if not isinstance(entry, dict):
+                return None, None
+            code, span = entry.get("code"), entry.get("span_khz")
+            if type(code) is not int or type(span) is not int or span <= 0:
+                return None, None
+            spans[code] = span
+        # effective values must agree with the capability table: the GUI
+        # labels axes from rate-code spans and offers fft sizes from caps.
+        if (type(eff.get("fft_size")) is not int
+                or eff["fft_size"] not in sizes
+                or type(eff.get("rate_code")) is not int
+                or eff["rate_code"] not in spans
+                or type(eff.get("span_khz")) is not int
+                or eff["span_khz"] != spans[eff["rate_code"]]):
+            return None, None
+        return (
+            {"fft_sizes": list(sizes),
+             "rate_codes": [{"code": c, "span_khz": s}
+                            for c, s in spans.items()],
+             "bin_unit": caps.get("bin_unit")},
+            {"fft_size": eff["fft_size"], "rate_code": eff["rate_code"],
+             "span_khz": eff["span_khz"]},
+        )
+
+    def accept_rf(self, frame: SpectrumRf) -> bool:
+        """Gate one 0x04 SPECTRUM_RF frame. True = apply to the display now
+        (live). Sweep frames stage and are returned by the next accepted
+        cycle marker via ``rf_flushed``. Stale epochs, the wrong band,
+        frames from closed cycles, metadata incoherent with the
+        acknowledged effective/caps/mode/channel contract, and any state
+        without a valid RF capability ack are dropped (fail closed)."""
+        if (not self.rf_ready or frame.epoch != self.epoch
+                or frame.band != self.band):
+            return False
+        if self._last_cycle is not None and frame.cycle <= self._last_cycle:
+            return False
+        if not self._rf_coherent(frame):
+            return False
+        if self.mode == 1:               # sweep stages until the cycle marker
+            if (self._rf_stage_cycle is not None
+                    and frame.cycle != self._rf_stage_cycle):
+                self.rf_stage.clear()    # partial cycle dropped (pause/abort)
+            self._rf_stage_cycle = frame.cycle
+            # bounded: at most one frame per advertised channel per cycle;
+            # a duplicate replaces instead of growing the stage
+            self.rf_stage[frame.channel] = frame
+            return False
+        return True
+
+    def _rf_coherent(self, frame: SpectrumRf) -> bool:
+        """Frame metadata must agree with the acknowledged contract:
+        effective fft/span, active mode, advertised channel, and the
+        rate_code -> caps entry lookup (by code, never array position)."""
+        eff = self.spectrum_effective or {}
+        if frame.fft_size != eff.get("fft_size"):
+            return False
+        if frame.span_khz != eff.get("span_khz"):
+            return False
+        if frame.mode != self.mode:
+            return False
+        if frame.channel not in self.channels:
+            return False
+        caps = self.spectrum_caps or {}
+        entries = [r for r in caps.get("rate_codes", [])
+                   if r.get("code") == frame.rate_code]
+        return (len(entries) == 1
+                and entries[0].get("span_khz") == frame.span_khz)
 
     def _accumulate_aps(self, observation: ChannelObservation) -> None:
         for ap in observation.aps:
@@ -213,6 +405,8 @@ class MonitorState:
         cycle = data.get("cycle")
         if type(cycle) is not int:
             raise ValueError("channel event requires integer cycle")
+        if not 0 <= cycle <= 0xFFFFFFFF:
+            raise ValueError("channel cycle out of uint32 range")
         # A replay at or below the last completed cycle is late/duplicate:
         # accepting it would resurrect values the bookkeeping superseded.
         if self._last_cycle is not None and cycle <= self._last_cycle:
@@ -234,10 +428,35 @@ class MonitorState:
                 self.staging.clear()     # partial cycle dropped (pause/abort)
             self._staging_cycle = cycle
             self.staging[observation.channel] = observation
+            # coverage wins over util: the staging scope is decided FIRST,
+            # only then may this channel's util be staged (or gap)
+            self._accept_util(data, observation, cycle)
             return False
+        self._accept_util(data, observation, cycle)
         self.displayed[observation.channel] = observation
         self._accumulate_aps(observation)
         return True
+
+    def _accept_util(self, data: dict, observation: ChannelObservation,
+                     cycle: int) -> None:
+        """Cycle-scoped, channel-bounded util write for ONE accepted
+        channel event: only advertised channels may enter the maps (at most
+        len(self.channels) entries), and a scope rejection touches NOTHING.
+        Absence/invalid/unproven = gap - never stale, never zero-filled."""
+        if not self._util_scope(cycle):
+            return                  # older scope: no write, no replace
+        sample = (parse_channel_util(data.get("util"))
+                  if self.utilization_available
+                  and observation.channel in self.channels else None)
+        if sample is None:
+            self.util_stage.pop(observation.channel, None)
+            if self.mode == 0:      # LIVE gaps immediately; SWEEP keeps
+                self.util_samples.pop(observation.channel, None)  # old
+                # published value until the matching marker replaces it
+        else:
+            self.util_stage[observation.channel] = sample
+            if self.mode == 0:      # live publishes immediately
+                self.util_samples[observation.channel] = sample
 
     def _accept_cycle(self, data: dict) -> bool:
         if not self._measurement_epoch_ok(data):
@@ -246,11 +465,14 @@ class MonitorState:
         cycle = data.get("cycle")
         if type(epoch) is not int or type(cycle) is not int:
             raise ValueError("cycle event requires integer epoch and cycle")
+        if not 0 <= cycle <= 0xFFFFFFFF:
+            raise ValueError("cycle id out of uint32 range")
         # Serial delivers cycles in order within an epoch: a id <= the
         # highest accepted one is a duplicate or a stale replay.
         if self._last_cycle is not None and cycle <= self._last_cycle:
             return False
         self._last_cycle = cycle
+        self.rf_flushed = []              # consume-once per accepted marker
         self.cycles += 1
         # The marker closes only its OWN cycle's coverage. When the marker's
         # observations never arrived (lost frames, or a marker ahead of all
@@ -268,6 +490,30 @@ class MonitorState:
                     self._accumulate_aps(observation)
             self.staging.clear()     # never flush an older cycle as current
         self._staging_cycle = None
+        # RF sweep staging: only frames whose OWN cycle matches the marker
+        # are flushed; an older partial stage is dropped, never current.
+        if self.rf_stage:
+            if self._rf_stage_cycle == cycle:
+                self.rf_flushed = list(self.rf_stage.values())
+            self.rf_stage.clear()
+        self._rf_stage_cycle = None
+        # util flush: the published snapshot is replaced ONLY by its OWN
+        # matching marker (exact staged subset). A NEWER marker that saw no
+        # channel util publishes an EMPTY set - never an older stage; an
+        # OLDER marker never replaces newer state. The cycle id is the
+        # scope HIGH-WATER mark (never reset to None): lost-marker jumps
+        # stay detectable by _util_scope.
+        if self._util_stage_cycle is None:
+            self.util_samples = {}      # nothing ever staged: publish none
+            self.util_stage.clear()
+        elif cycle == self._util_stage_cycle:
+            self.util_samples = dict(self.util_stage)   # exact subset
+            self.util_stage.clear()
+        elif cycle > self._util_stage_cycle:
+            self.util_stage.clear()     # stale older stage discarded
+            self.util_samples = {}      # newer cycle had no util -> empty
+            self._util_stage_cycle = cycle
+        # else: an OLDER marker - newer staged/published state stays intact
         self.elapsed_ms = data.get("elapsed_ms")
         self.uptime_ms = data.get("uptime_ms")
         return True
@@ -279,6 +525,15 @@ class MonitorState:
         code = str(data.get("code", "unknown"))
         if type(ch) is not int:
             raise ValueError("channel_error without channel")
+        # high-water guard runs FIRST: an older cycle's error can never
+        # invalidate newer util; a newer/unknown cycle may (and starts a
+        # fresh scope via _util_scope before the pops)
+        cycle = data.get("cycle")
+        if type(cycle) is not int or self._util_scope(cycle):
+            # a failed dwell invalidates that channel's util NOW - staged
+            # or published - so a failed channel cannot retain old percent
+            self.util_stage.pop(ch, None)
+            self.util_samples.pop(ch, None)
         self.last_error = f"ch {ch}: {code}"
         already = ch in self.unavailable
         self.unavailable.add(ch)

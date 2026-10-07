@@ -9,7 +9,7 @@ import serial
 from PySide6.QtCore import QThread, Signal
 from serial.tools import list_ports
 
-from .tlv import ChannelUtil, Spectrum, Status, TlvParser
+from .tlv import ChannelUtil, Spectrum, SpectrumRf, Status, TlvParser
 
 
 def _port_sort_key(device: str) -> list:
@@ -37,6 +37,7 @@ class SerialReader(QThread):
     """
 
     spectrum = Signal(object)       # tlv.Spectrum
+    spectrum_rf = Signal(object)    # tlv.SpectrumRf (0x04 real RF frames)
     ch_util = Signal(object)        # tlv.ChannelUtil
     status = Signal(object)         # tlv.Status
     error = Signal(str)
@@ -77,6 +78,8 @@ class SerialReader(QThread):
     def _dispatch(self, msg) -> None:
         if isinstance(msg, Spectrum):
             self.spectrum.emit(msg)
+        elif isinstance(msg, SpectrumRf):
+            self.spectrum_rf.emit(msg)
         elif isinstance(msg, ChannelUtil):
             self.ch_util.emit(msg)
         elif isinstance(msg, Status):

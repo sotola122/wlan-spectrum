@@ -314,6 +314,139 @@ static void case_radio_gating(void) {
     printf("radio-gating ok\n");
 }
 
+/* CCA window: read-only telemetry across begin/finish, wrap-safe deltas,
+ * flag capture at both ends, exact t_us window, and conservative JSON
+ * presence/absence (raw object only when both ends were sampled). */
+static void case_radio_util(void) {
+    MonitorObservation out;
+
+    /* 1. no begin -> no window -> truthful absence */
+    memset(&out, 0, sizeof out);
+    monitor_radio_finish(&out);
+    assert(!out.util_valid);
+
+    /* 2. valid ENDPOINT window: value=0x400 read at the call site, A
+     * saturates at the limit, done flag flips, B stays 0. */
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_time_autostep(10u);
+    fake_cca_step(80u, 0u);
+    uint32_t calls0 = fake_cca_set_cnt_calls();
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(fake_cca_set_cnt_calls() == calls0 + 1u);
+    assert(fake_cca_set_cnt_value() == 0x400u);
+    assert(fake_cca_set_cnt_arm() == 1u);
+    monitor_radio_finish(&out);
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    assert(out.util_valid);
+    assert(out.util_total == 0x400u);        /* A final == configured limit */
+    assert(out.util_busy == 0u);
+    assert(out.util_window_us_upper > 0u &&
+           out.util_window_us_upper <= 5000u);
+
+    /* 3. formatter: EXACT frozen 5 fields, no pairs/busy_frac */
+    MonitorChannelEvent ev = {.epoch = 1, .cycle = 2, .observation = &out};
+    char json[4096];
+    size_t n = monitor_format_channel_event(json, sizeof json, &ev);
+    assert(n > 0);
+    assert(strstr(json, "\"util\"") != NULL);
+    assert(strstr(json, "\"source\":\"c5_v6.0.3_phy_cca_cnt\"") != NULL);
+    assert(strstr(json, "\"confidence\":\"experimental_sampled\"") != NULL);
+    assert(strstr(json, "\"window_us_upper\"") != NULL);
+    assert(strstr(json, "\"busy_frac\"") == NULL);
+    assert(strstr(json, "\"pairs\"") == NULL);
+
+    /* 4. B overshoot -> busy > total -> invalid gap */
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_time_autostep(10u);
+    fake_cca_step(80u, 240u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    monitor_radio_finish(&out);
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    assert(!out.util_valid);
+    ev.observation = &out;
+    n = monitor_format_channel_event(json, sizeof json, &ev);
+    assert(n > 0 && strstr(json, "\"util\"") == NULL);
+
+    /* 5. completion never observed -> invalid */
+    fake_cca_ctrl_set(0x87ffffffu);
+    fake_cca_set(0u, 0u, 0u);
+    fake_time_autostep(10u);
+    fake_cca_step(1u, 0u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    monitor_radio_finish(&out);
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    assert(!out.util_valid);
+
+    /* 6. completed before first read -> invalid (no reset proof) */
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(2000u, 0u, 0u);
+    fake_time_autostep(10u);
+    fake_cca_step(80u, 0u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    monitor_radio_finish(&out);
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    assert(!out.util_valid);
+
+    /* 7. valid with B tracking below A */
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_time_autostep(10u);
+    fake_cca_step(80u, 40u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    monitor_radio_finish(&out);
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    assert(out.util_valid);
+    assert(out.util_total == 0x400u);
+    assert(out.util_busy > 0u && out.util_busy <= out.util_total);
+    ev.observation = &out;
+    n = monitor_format_channel_event(json, sizeof json, &ev);
+    assert(n > 0 && strstr(json, "\"util\"") != NULL);
+
+    /* 8. failed begin: no arm at all */
+    uint32_t c0 = fake_cca_set_cnt_calls();
+    fake_wifi_set_channel_result(ESP_ERR_INVALID_STATE);
+    assert(monitor_radio_begin(0, 6) == ESP_ERR_INVALID_STATE);
+    fake_wifi_set_channel_result(ESP_OK);
+    assert(fake_cca_set_cnt_calls() == c0);
+
+    /* 9. frozen clock + non-completing counter: the one-shot loop must
+     * terminate via the poll-iteration bound (no hang), window invalid */
+    fake_cca_ctrl_set(0x87ffffffu);
+    fake_cca_set(0u, 0u, 0u);
+    fake_time_autostep(0u);                /* clock frozen */
+    fake_cca_step(0u, 0u);                 /* counter never advances */
+    assert(monitor_radio_begin(0, 6) == ESP_OK);   /* returns, no hang */
+    monitor_radio_finish(&out);
+    assert(!out.util_valid);
+
+    /* 10. valid begin -> failed begin -> finish: the stale window is
+     * invalidated by the failed begin's entry (case 8 alone cannot prove
+     * this: it never had an armed window pending) */
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_time_autostep(10u);
+    fake_cca_step(80u, 0u);
+    assert(monitor_radio_begin(0, 6) == ESP_OK);   /* window armed */
+    uint32_t c1 = fake_cca_set_cnt_calls();
+    fake_wifi_set_channel_result(ESP_ERR_INVALID_STATE);
+    assert(monitor_radio_begin(0, 6) == ESP_ERR_INVALID_STATE);
+    fake_wifi_set_channel_result(ESP_OK);
+    assert(fake_cca_set_cnt_calls() == c1);        /* failed begin: no arm */
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    monitor_radio_finish(&out);
+    assert(!out.util_valid);                       /* stale window gone */
+
+    printf("radio-util ok\n");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);
@@ -349,6 +482,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "radio-gating") == 0) {
         case_radio_gating();
+        return 0;
+    }
+    if (strcmp(argv[1], "radio-util") == 0) {
+        case_radio_util();
         return 0;
     }
     fprintf(stderr, "unknown case: %s\n", argv[1]);

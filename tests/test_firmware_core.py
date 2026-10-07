@@ -12,10 +12,14 @@ import subprocess
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from wifi_spectrum.tlv import Status, TlvParser
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE_SRC = ROOT / "firmware" / "main" / "monitor_core.c"
+SPECTRUM_SRC = ROOT / "firmware" / "main" / "monitor_spectrum.c"
+CAPTURE_SRC = ROOT / "firmware" / "main" / "monitor_capture.c"
 LINK_SRC = ROOT / "firmware" / "main" / "monitor_link.c"
 RADIO_SRC = ROOT / "firmware" / "main" / "monitor_radio.c"
 FAKE_SDK_DIR = ROOT / "tests" / "native" / "fake_sdk"
@@ -87,11 +91,12 @@ def _compile_adapters() -> Path:
         raise AssertionError(f"cJSON compile failed:\n{proc.stdout}\n{proc.stderr}")
     exe = OUT_DIR / "monitor_adapter_fixture"
     cmd = [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1",
+           "-DMONITOR_CCA_CTRL_TEST",
            "-I", str(FAKE_SDK_DIR), "-I", str(ROOT / "firmware" / "main"),
            "-I", str(CJSON_DIR),
-           str(CORE_SRC), str(LINK_SRC), str(RADIO_SRC),
+           str(CORE_SRC), str(SPECTRUM_SRC), str(LINK_SRC), str(RADIO_SRC),
            str(FAKE_SDK_DIR / "fake_sdk.c"), str(ADAPTER_FIXTURE_SRC),
-           str(cjson_obj), "-pthread", "-o", str(exe)]
+           str(cjson_obj), "-pthread", "-lm", "-o", str(exe)]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if proc.returncode != 0:
         raise AssertionError(
@@ -301,7 +306,8 @@ class AppMainApplyAckTests(unittest.TestCase):
                "-I", str(CJSON_DIR),
                f'-DAPP_MAIN_PATH="{app_main_source}"',
                str(ROOT / "tests" / "native" / "app_main_fixture.c"),
-               str(CORE_SRC), str(cjson_obj), "-o", str(target)]
+               str(CORE_SRC), str(SPECTRUM_SRC), str(cjson_obj), "-lm",
+               "-o", str(target)]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
             raise AssertionError(
@@ -344,6 +350,17 @@ class AppMainApplyAckTests(unittest.TestCase):
                     f"site {site}: defect NOT detected (rc=0)")
                 self.assertIn("epoch-2 measurement before ack",
                               proc.stderr + proc.stdout)
+
+    def test_capture_failure_propagates_channel_error(self) -> None:
+        """Snapshot failure => channel_error spectrum_capture, NO 0x04 frame."""
+        exe = OUT_DIR / "app_main_fixture"
+        self._build(exe, ROOT / "firmware" / "main" / "app_main.c")
+        proc = subprocess.run([str(exe), "3"], capture_output=True,
+                              text=True, timeout=120)
+        self.assertEqual(
+            proc.returncode, 0,
+            f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}")
+        self.assertIn("capture-failure propagation ok", proc.stdout)
 
 
 class AdapterSeamTests(unittest.TestCase):
@@ -393,6 +410,12 @@ class AdapterSeamTests(unittest.TestCase):
     def test_radio_gating_and_queue_drop_independence(self) -> None:
         _run(self.exe, "radio-gating")
 
+    def test_radio_util_window(self) -> None:
+        # per-valid-dwell armed one-shot: call-site value, exactly one arm,
+        # strict validity (busy<=total, completion, endpoint), util object
+        # keys, truthful gap when invalid, no arm on failed begin
+        _run(self.exe, "radio-util")
+
     def test_tx_task_frame_not_on_task_stack(self) -> None:
         # A 4103-byte MonitorTlvFrame local would exceed the 4096-byte TX
         # task stack (and nested wasting the app task's stack) before any
@@ -402,6 +425,168 @@ class AdapterSeamTests(unittest.TestCase):
             usage = _func_stack_usage[func]
             self.assertLess(usage, 1024,
                             f"{func} own frame {usage} B — frame on stack?")
+
+
+class SpectrumWireTests(unittest.TestCase):
+    """monitor_spectrum.c/monitor_capture.c against the frozen handoff v2.1:
+    golden frame, numpy tone oracle (independent FFT), honest rate/fft
+    mapping, sentinel validation for partial/overrun captures."""
+
+    exe: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cc = _require_cc()
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        cjson_obj = OUT_DIR / "cJSON.o"
+        subprocess.run(
+            [cc, "-std=c11", "-O1", "-I", str(CJSON_DIR), "-c",
+             str(CJSON_SRC), "-o", str(cjson_obj)],
+            check=True, capture_output=True, text=True, timeout=120)
+        cls.exe = OUT_DIR / "spectrum_fixture"
+        cmd = [cc] + CFLAGS + ["-I", str(FAKE_SDK_DIR),
+                        str(ROOT / "tests" / "native" /
+                            "monitor_spectrum_fixture.c"),
+                        str(SPECTRUM_SRC), str(CAPTURE_SRC), str(CORE_SRC),
+                        str(ROOT / "tests" / "native" / "fake_sdk" /
+                            "fake_sdk.c"),
+                        str(cjson_obj), "-lm", "-o", str(cls.exe)]
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=120)
+        if proc.returncode != 0:
+            raise AssertionError(
+                f"spectrum fixture compile failed:\n{proc.stdout}\n{proc.stderr}")
+
+    @classmethod
+    def _run_mode(cls, *args: str, stdin: bytes = b"") -> str:
+        proc = subprocess.run([str(cls.exe), *args], input=stdin,
+                              capture_output=True, timeout=120)
+        if proc.returncode != 0:
+            raise AssertionError(
+                f"fixture {args} rc={proc.returncode}: "
+                f"{proc.stdout!r} {proc.stderr!r}")
+        return proc.stdout.decode().strip()
+
+    def test_golden_frame_matches_parent_hex(self) -> None:
+        golden = (
+            "04280001000000000000000001000008000000e0cd2400204e00000000"
+            "9cff38ffd4fe70fe0cfea8fd44fd9f7a8723")
+        self.assertEqual(self._run_mode("golden"), golden)
+
+    def test_effective_mapping_reports_actuals(self) -> None:
+        for fft, rate, expected in (
+            (64, 20000, "64 2 20000"),
+            (128, 40000, "128 1 40000"),
+            (100, 40000, "64 1 40000"),      # request adapts DOWN honestly
+            (2048, 20000, "1024 2 20000"),
+            (64, 12345, "64 255 0"),          # unknown stays unknown
+        ):
+            with self.subTest(fft=fft, rate=rate):
+                self.assertEqual(
+                    self._run_mode("map", str(fft), str(rate)), expected)
+
+    def test_rejection_paths(self) -> None:
+        self.assertEqual(self._run_mode("invalid"), "ok")
+
+    def test_capture_sentinel_validation(self) -> None:
+        # OK, partial(range), first-word-only, overrun, NULL — see fixture
+        self.assertEqual(self._run_mode("validate"), "0 2 2 3 1")
+
+    @staticmethod
+    def _tone_words(n: int, k0: int, amp: int) -> np.ndarray:
+        nn = np.arange(n)
+        i = np.rint(np.cos(2 * np.pi * k0 * nn / n) * amp)
+        q = np.rint(np.sin(2 * np.pi * k0 * nn / n) * amp)
+        i10 = np.clip(i, -512, 511).astype(np.int64) & 0x3FF
+        q10 = np.clip(q, -512, 511).astype(np.int64) & 0x3FF
+        return (i10 | (q10 << 10)).astype("<u4")
+
+    @staticmethod
+    def _reference_bins(words: np.ndarray) -> np.ndarray:
+        n = len(words)
+        w = words.astype(np.uint32)
+        i = (w & 0x3FF).astype(np.int64)
+        i = np.where(i & 0x200, i - 0x400, i)
+        q = ((w >> 10) & 0x3FF).astype(np.int64)
+        q = np.where(q & 0x200, q - 0x400, q)
+        x = (i + 1j * q) / 512.0
+        nn = np.arange(n)
+        hann = 0.5 * (1.0 - np.cos(2 * np.pi * nn / n))
+        X = np.fft.fft(x * hann)
+        W = hann.sum()
+        P = np.abs(X) ** 2 / (W * W)
+        dbfs = 10.0 * np.log10(np.maximum(P, 1.0e-30))
+        idx = (np.arange(n) + n // 2) % n          # frozen fftshift order
+        shifted = dbfs[idx]
+        return np.clip(np.round(shifted * 100.0), -32768, 32767)
+
+    def _fixture_bins(self, words: np.ndarray) -> np.ndarray:
+        out = self._run_mode("bins", str(len(words)),
+                             stdin=words.tobytes())
+        return np.array([int(v) for v in out.split()], dtype=np.int64)
+
+    def test_tones_match_numpy_reference(self) -> None:
+        """Independent oracle: positive/negative/DC/half/noise vectors. Any
+        twiddle/stride defect (e.g. one stride for all FFT stages) fails
+        this before hardware.
+
+        Comparison ranges: the tracked lobe (within 60 dB of the reference
+        peak) must match the float64 reference within 30 centi-dB; the deep
+        noise floor is float32-vs-float64 limited, so it is only bounded
+        (never above the peak, never fabricated) there.
+        """
+        cases = [
+            ("pos", 64, 5, 511),
+            ("neg", 64, -7, 511),
+            ("half", 64, 5, 255),
+            ("dc", 64, 0, 200),
+        ]
+        peak_dbfs: dict[str, int] = {}
+        for name, n, k0, amp in cases:
+            with self.subTest(case=name):
+                words = self._tone_words(n, k0, amp)
+                got = self._fixture_bins(words)
+                want = self._reference_bins(words)
+                self.assertEqual(len(got), n)
+                peak_want = int(np.max(want))
+                mask = want >= peak_want - 6000
+                diff = np.abs(got - want)[mask]
+                self.assertLessEqual(
+                    int(np.max(diff)), 30,
+                    f"{name}: tracked lobe diverges: "
+                    f"max={int(np.max(diff))} centi-dB")
+                # No fabricated energy above the reference peak anywhere.
+                self.assertLessEqual(int(np.max(got)), peak_want + 50,
+                                     f"{name}: bin above reference peak")
+                if name != "half":
+                    expect_k = (k0 - n // 2) % n
+                    self.assertEqual(int(np.argmax(got)), expect_k,
+                                     f"{name}: fftshift peak misplaced")
+                peak_dbfs[name] = int(np.max(got))
+                # Peak magnitude itself must hit the float64 reference.
+                self.assertLessEqual(
+                    abs(int(np.max(got)) - int(np.max(want))), 3,
+                    f"{name}: peak power off")
+        # complex-tone amplitude law: -6.02 dB at half amplitude
+        delta = peak_dbfs["half"] - peak_dbfs["pos"]
+        self.assertLessEqual(abs(delta - (-602)), 8,
+                             f"half-vs-full peak delta {delta} centi-dB")
+
+    def test_noise_is_deterministic_and_finite(self) -> None:
+        rng = np.random.default_rng(7)
+        words = rng.integers(0, 1 << 20, 128, dtype="<u4")
+        first = self._fixture_bins(words)
+        second = self._fixture_bins(words)
+        np.testing.assert_array_equal(first, second)
+        self.assertTrue(np.all(first >= -32768) and np.all(first <= 32767))
+        want = self._reference_bins(words)
+        peak_want = int(np.max(want))
+        mask = want >= peak_want - 6000
+        diff = np.abs(first - want)[mask]
+        self.assertLessEqual(int(np.max(diff)), 30,
+                             f"noise tracked range diverges: "
+                             f"max={int(np.max(diff))}")
+        self.assertLessEqual(int(np.max(first)), peak_want + 50)
 
 
 if __name__ == "__main__":

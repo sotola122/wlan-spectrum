@@ -32,6 +32,7 @@
 #include "esp_err.h"
 
 #include "monitor_core.h"
+#include "monitor_spectrum.h"
 
 /* Install the UART0 driver and TX task. Bounded resources:
  * RX ring 512 B, TX ring 0 (direct FIFO writes), frame queue depth 4.
@@ -55,6 +56,19 @@ bool monitor_link_take_invalid_config(void);
  * or the queue is full; then the whole not-yet-started frame is dropped and
  * counted in tx_dropped (never a partial frame on the wire). */
 bool monitor_link_submit_json(const char *json_body, size_t length_bytes);
+
+/* Enqueue one pre-framed device->host TLV frame (e.g. SPECTRUM_RF built by
+ * monitor_tlv_wrap_spectrum). Application task only. Validates non-empty
+ * length within MONITOR_TLV_FRAME_CAPACITY_BYTES; on queue-full the whole
+ * frame is dropped and counted in tx_dropped (same contract as submit_json,
+ * never a partial frame). */
+bool monitor_link_submit_frame(const MonitorTlvFrame *frame);
+
+/* Wrap a SPECTRUM_RF event (handoff v2.1, type 0x04) using the link's own
+ * persistent frame buffer and enqueue it. Application task only; same
+ * drop contract as submit_json (wrap failure or queue-full = whole frame
+ * dropped and counted). */
+bool monitor_link_submit_spectrum(const MonitorSpectrumEvent *event);
 
 /* Whole frames dropped because the TX queue was full or a write exceeded
  * its 30 s deadline. Monotonic; incremented under g_tx_drop_lock from the

@@ -16,6 +16,16 @@ from wifi_spectrum.tlv import Status, TlvParser, crc32, encode_config
 # Golden CONFIG: Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s + CRC 95 56 4e 1d
 CONFIG_GOLDEN = bytes.fromhex("100a000101e8034000204e000095564e1d")
 
+# Golden SPECTRUM_RF 0x04 (handoff v2 section 7, parent-verified):
+# epoch=1 cycle=0 band=0 ch=1 mode=0 rate_code=0 fft_size=8 source=0
+# center_khz=2412000 span_khz=20000 power_dbfs=[0,-100,...,-700] centi-dBFS
+# crc32 value 0x23877a9f (LE bytes 9f7a8723)
+SPECTRUM_RF_GOLDEN = bytes.fromhex(
+    "04280001000000000000000001000008000000e0cd2400204e0000"
+    "00009cff38ffd4fe70fe0cfea8fd44fd9f7a8723")
+RF_GOLDEN_FREQS_MHZ = [2402.0, 2404.5, 2407.0, 2409.5, 2412.0,
+                       2414.5, 2417.0, 2419.5]
+
 
 def parse(*chunks: bytes) -> tuple[list, int]:
     parser = TlvParser()
@@ -49,6 +59,9 @@ class FrameRoundTripTests(unittest.TestCase):
             tlv.encode_status_json({"schema": "wifi-monitor/1"}),
             tlv.encode_ch_util(0, {6: 40}),
             tlv.encode_spectrum(2412.0, 0.5, [-54.25, -70.0]),
+            tlv.encode_spectrum_rf(1, 0, 0, 1, 0, 0, 0, 2412000, 20000,
+                                   [0.0, -1.0, -2.0, -3.0,
+                                    -4.0, -5.0, -6.0, -7.0]),
         ]
         for frame in frames:
             with self.subTest(type=frame[0]):
@@ -246,12 +259,34 @@ class EarlyLengthRejectionTests(unittest.TestCase):
             with self.subTest(name):
                 self._assert_good_after(false_header)
 
+    def test_rf_payload_bounds_rejected_from_header(self) -> None:
+        # 0x04 payload must be 24 + 2*N with 2 <= N <= RF_MAX_BINS (2036),
+        # i.e. 28..4096 bytes, mod 4. Each fixture's payload prefix agrees
+        # with its claimed length (fft_size at payload offset 12), so only
+        # a header-level bound can reject it: without the bound the parser
+        # waits for the advertised total (up to a full MAX_PAYLOAD stall)
+        # and the three good frames behind it never decode.
+        def rf_prefix(ln: int) -> bytes:
+            bins = (ln - 24) // 2
+            return (bytes([tlv.T_SPECTRUM_RF, ln & 0xFF, ln >> 8])
+                    + bytes(12) + bins.to_bytes(2, "little"))
+
+        for ln in (24, 5120, 8192):
+            with self.subTest(payload_length=ln):
+                false_prefix = rf_prefix(ln)
+                self.assertEqual(int.from_bytes(false_prefix[1:3], "little"),
+                                 ln)
+                self.assertEqual((ln - 24) % 4, 0)   # mod-4 passes: the
+                # header bound (28..4096) is the only thing left to reject
+                self._assert_good_after(false_prefix)
+
     def test_valid_fragmented_frames_survive_length_checks(self) -> None:
         frames = [
             tlv.encode_status_json({"n": 1}),
             tlv.encode_spectrum(2412.0, 0.5, [-54.25, -70.0]),
             tlv.encode_ch_util(0, {6: 40, 11: 7}),
             encode_config(1, 1, 1000, 64, 20000),
+            SPECTRUM_RF_GOLDEN,
         ]
         for frame in frames:
             with self.subTest(type=frame[0]):
@@ -275,6 +310,134 @@ class EarlyLengthRejectionTests(unittest.TestCase):
         goods = [m for m in messages
                  if isinstance(m, Status) and m.data == {"ok": True}]
         self.assertGreaterEqual(len(goods), 1)
+        self.assertGreater(errors, 0)
+
+
+class SpectrumRfCodecTests(unittest.TestCase):
+    """0x04 SPECTRUM_RF per handoff v2: frozen 24-byte header, fftshift
+    bin order, centi-dBFS power, no dBm conversion anywhere."""
+
+    def test_golden_frame_parses_to_published_fields(self) -> None:
+        self.assertEqual(len(SPECTRUM_RF_GOLDEN), 47)
+        # CRC recompute over bytes[:-4] must equal the published value
+        self.assertEqual(crc32(SPECTRUM_RF_GOLDEN[:-4]), 0x23877A9F)
+        messages, errors = parse(SPECTRUM_RF_GOLDEN)
+        self.assertEqual(errors, 0)
+        msg = messages[0]
+        self.assertIsInstance(msg, tlv.SpectrumRf)
+        self.assertEqual(
+            (msg.epoch, msg.cycle, msg.band, msg.channel, msg.mode,
+             msg.rate_code, msg.fft_size, msg.source),
+            (1, 0, 0, 1, 0, 0, 8, 0))
+        self.assertEqual((msg.center_khz, msg.span_khz), (2412000, 20000))
+        self.assertEqual(list(msg.power_dbfs),
+                         [0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0])
+        # fftshift order: f_k = center - span/2 + k*span/N [MHz]
+        self.assertEqual([round(f, 3) for f in msg.freqs],
+                         RF_GOLDEN_FREQS_MHZ)
+
+    def test_encoder_reproduces_golden_bytes(self) -> None:
+        frame = tlv.encode_spectrum_rf(1, 0, 0, 1, 0, 0, 0, 2412000, 20000,
+                                       [0.0, -1.0, -2.0, -3.0,
+                                        -4.0, -5.0, -6.0, -7.0])
+        self.assertEqual(frame, SPECTRUM_RF_GOLDEN)
+
+    def test_power_is_plain_float_dbfs_field_not_dbm(self) -> None:
+        messages, _ = parse(SPECTRUM_RF_GOLDEN)
+        msg = messages[0]
+        self.assertEqual(msg.power_dbfs.dtype.name, "float32")
+        # wire int16 centi-dBFS -3450 must arrive as -34.50 dBFS
+        frame = tlv.encode_spectrum_rf(1, 1, 1, 36, 1, 2, 0, 5180000,
+                                       40000, [-34.5, -60.01])
+        parsed, errors = parse(frame)
+        self.assertEqual(errors, 0)
+        self.assertEqual([round(float(v), 2) for v in parsed[0].power_dbfs],
+                         [-34.5, -60.01])
+
+    def test_payload_length_mismatch_rejected(self) -> None:
+        # Decode-level: payload shorter than its own declared fft_size.
+        payload = SPECTRUM_RF_GOLDEN[3:43]        # the 40-byte payload
+        self.assertRaises(ValueError, tlv.decode, tlv.T_SPECTRUM_RF,
+                          payload[:-2])
+        # Wire-level: a length below the 24-byte header is garbage from
+        # the header alone; the stream resyncs to the valid frames after.
+        false_header = bytes([tlv.T_SPECTRUM_RF, 0x0A, 0x00])
+        messages, errors = parse(false_header + SPECTRUM_RF_GOLDEN)
+        self.assertEqual(len([m for m in messages
+                              if isinstance(m, tlv.SpectrumRf)]), 1)
+        self.assertGreater(errors, 0)
+
+    def test_declared_length_disagreeing_with_fft_size_rejected_early(self) -> None:
+        # prefix says fft_size=8 -> payload must be 40; claim 42 instead.
+        # Rejected before buffering the advertised length: a valid golden
+        # frame immediately after must still decode.
+        false_header = bytes([tlv.T_SPECTRUM_RF, 0x2A, 0x00])
+        messages, errors = parse(false_header + SPECTRUM_RF_GOLDEN * 2)
+        goldens = [m for m in messages if isinstance(m, tlv.SpectrumRf)]
+        self.assertEqual(len(goldens), 2)
+        self.assertGreater(errors, 0)
+
+    def test_odd_fft_size_rejected_from_header(self) -> None:
+        # payload 24 + 2*7 = 38 (0x26): ln ≡ 2 (mod 4) means odd N -> drop
+        # the header without buffering, before any golden frame after it.
+        false_header = bytes([tlv.T_SPECTRUM_RF, 0x26, 0x00])
+        messages, errors = parse(false_header + SPECTRUM_RF_GOLDEN * 2)
+        goldens = [m for m in messages if isinstance(m, tlv.SpectrumRf)]
+        self.assertEqual(len(goldens), 2)
+        self.assertGreater(errors, 0)
+
+    def test_unknown_source_is_dropped_as_parser_error(self) -> None:
+        # source != 0 must be ignored AND counted (handoff section 4), and
+        # the valid frame after it must survive.
+        bad = bytearray(tlv.encode_spectrum_rf(
+            1, 0, 0, 1, 0, 0, source=7, center_khz=2412000, span_khz=20000,
+            power_dbfs=[-10.0, -20.0]))
+        messages, errors = parse(bytes(bad) + SPECTRUM_RF_GOLDEN)
+        self.assertEqual(len([m for m in messages
+                              if isinstance(m, tlv.SpectrumRf)]), 1)
+        self.assertGreater(errors, 0)
+
+    def test_zero_span_rejected(self) -> None:
+        frame = tlv.encode_spectrum_rf(1, 0, 0, 1, 0, 0, 0, 2412000, 0,
+                                       [-10.0, -20.0])
+        messages, errors = parse(frame + SPECTRUM_RF_GOLDEN)
+        self.assertEqual(len([m for m in messages
+                              if isinstance(m, tlv.SpectrumRf)]), 1)
+        self.assertGreater(errors, 0)
+
+    def test_invalid_enum_values_rejected(self) -> None:
+        cases = {
+            "band=2": tlv.encode_spectrum_rf(1, 0, 2, 1, 0, 0, 0,
+                                             2412000, 20000,
+                                             [-10.0, -20.0]),
+            "mode=3": tlv.encode_spectrum_rf(1, 0, 0, 1, 3, 0, 0,
+                                             2412000, 20000,
+                                             [-10.0, -20.0]),
+            "channel=0": tlv.encode_spectrum_rf(1, 0, 0, 0, 0, 0, 0,
+                                                2412000, 20000,
+                                                [-10.0, -20.0]),
+        }
+        for name, frame in cases.items():
+            with self.subTest(name):
+                messages, errors = parse(frame)
+                self.assertEqual(messages, [])
+                self.assertGreater(errors, 0)
+
+    def test_golden_frame_byte_at_a_time_and_concatenated(self) -> None:
+        wire = SPECTRUM_RF_GOLDEN * 2
+        messages, errors = parse(*(wire[i:i + 1]
+                                   for i in range(len(wire))))
+        self.assertEqual(errors, 0)
+        self.assertEqual(len(messages), 2)
+        messages, errors = parse(wire)
+        self.assertEqual(errors, 0)
+        self.assertEqual(len(messages), 2)
+
+    def test_corrupted_rf_payload_rejected(self) -> None:
+        corrupt = bytearray(SPECTRUM_RF_GOLDEN)
+        corrupt[30] ^= 0x01                 # one bit inside the bins
+        messages, errors = parse(bytes(corrupt))
+        self.assertEqual(messages, [])
         self.assertGreater(errors, 0)
 
 

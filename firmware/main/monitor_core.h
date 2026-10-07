@@ -86,6 +86,11 @@ uint32_t monitor_dwell_ms(uint16_t sweep_ms, size_t channel_count);
 size_t monitor_band_channels(uint8_t band, uint8_t *out_channels,
                              size_t capacity);
 
+/* Center frequency in kHz of a JP receive channel (2407 + 5*ch for band 0,
+ * 5000 + 5*ch for band 1). Returns 0 when the band or channel is not in the
+ * allowlist above. Task-context, pure arithmetic after membership check. */
+uint32_t monitor_channel_center_khz(uint8_t band, uint8_t channel);
+
 /* -------------------------------------------------------------- ap sight */
 
 typedef struct {
@@ -119,6 +124,18 @@ typedef struct {
     MonitorAccessPoint access_points[MONITOR_MAX_ACCESS_POINTS];
     uint8_t access_point_count;
     uint32_t access_points_dropped;    /* unique-BSSID overflow + queue drops */
+    /* Sampled PHY CCA busy window (contract FINAL
+     * evidence/spectrum-cca-contract-final.md): armed one-shot per VALID
+     * dwell, parameter read from the control word at the call site
+     * (no literal, no other registers). ENDPOINT fields: busy = B final,
+     * total = A final (== the arm parameter); the formatter emits the
+     * frozen 5-field util object only when strictly valid — absence is the
+     * truthful gap (host computes 100*busy/total). NAV equivalence not
+     * established; not full-dwell; not calibrated energy. */
+    bool util_valid;
+    uint32_t util_window_us_upper;      /* arm -> first-done upper bound, us */
+    uint32_t util_busy;                 /* B final at completion */
+    uint32_t util_total;                /* A final at completion (== limit) */
 } MonitorObservation;
 
 /* Reset counters for a new dwell. Task context only (radio capture disabled). */
@@ -154,6 +171,18 @@ typedef struct {
     const uint8_t *channels;            /* borrowed for the call only */
     size_t channel_count;
     uint32_t tx_dropped;
+    /* Spectrum capability truth (evidence/spectrum-handoff.md v2.1):
+     * spectrum_available only after hardware capture proved working; the
+     * effective_* fields are the values the firmware will actually use
+     * (never a blind echo of the request). utilization_available declares
+     * CAPABILITY from boot (contract FINAL); per-dwell validity is the
+     * presence of the util object in the channel event — never a latch of
+     * the first valid sample. */
+    bool spectrum_available;
+    bool utilization_available;
+    uint16_t effective_fft_size;
+    uint8_t effective_rate_code;
+    uint32_t effective_span_khz;
 } MonitorConfigEvent;
 
 typedef struct {
@@ -205,6 +234,11 @@ size_t monitor_format_error_event(char *dst, size_t capacity_bytes,
                                   const char *code);
 size_t monitor_format_channel_error_event(char *dst, size_t capacity_bytes,
                                           const MonitorChannelErrorEvent *event);
+
+/* (diagnostic cca_arm event, trace types and replay macros removed —
+ * evidence raw logs remain in evidence/cca_*; the feature now emits only
+ * the per-dwell util object inside the channel event, contract proposal in
+ * evidence/spectrum-cca-contract-proposal.md.) */
 
 /* Wrap a JSON body in the device-to-PC STATUS frame (type 0x03,
  * little-endian length) and append the CRC-32/ISO-HDLC checksum over the

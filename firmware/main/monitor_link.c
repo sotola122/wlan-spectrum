@@ -201,6 +201,31 @@ bool monitor_link_submit_json(const char *json_body, size_t length_bytes) {
     return true;
 }
 
+static bool queue_frame(const MonitorTlvFrame *frame) {
+    if (g_tx_queue == NULL || frame == NULL || frame->length_bytes == 0 ||
+        frame->length_bytes > MONITOR_TLV_FRAME_CAPACITY_BYTES) {
+        return false;
+    }
+    if (xQueueSend(g_tx_queue, frame, 0) != pdTRUE) {
+        count_tx_drop();                        /* whole frame dropped */
+        return false;
+    }
+    return true;
+}
+
+bool monitor_link_submit_frame(const MonitorTlvFrame *frame) {
+    return queue_frame(frame);
+}
+
+bool monitor_link_submit_spectrum(const MonitorSpectrumEvent *event) {
+    if (event == NULL ||
+        !monitor_tlv_wrap_spectrum(&g_submit_frame, event)) {
+        count_tx_drop();                        /* invalid event never sent */
+        return false;
+    }
+    return queue_frame(&g_submit_frame);
+}
+
 uint32_t monitor_link_tx_dropped(void) {
     portENTER_CRITICAL(&g_tx_drop_lock);
     uint32_t dropped = g_tx_dropped;

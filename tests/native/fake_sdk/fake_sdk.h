@@ -11,6 +11,25 @@
 
 /* time */
 void fake_time_advance_us(int64_t delta_us);
+/* Gated auto-steps (test scaffolding for the util one-shot loop): default
+ * off; fixture enables only around a util case, restores after. */
+void fake_time_autostep(uint32_t step_us);
+void fake_cca_step(uint32_t a_step, uint32_t b_step);
+
+/* CCA counter telemetry fake (read-only phy_get_cca_cnt seam): returns the
+ * values planted by fake_cca_set plus the status flag. */
+uint32_t phy_get_cca_cnt(uint32_t out[2]);
+void fake_cca_set(uint32_t a, uint32_t b, uint32_t flag);
+
+/* Control word 0x600a7c58 seam for MONITOR_CCA_CTRL_TEST builds. */
+uint32_t fake_cca_ctrl_read(void);
+void fake_cca_ctrl_set(uint32_t value);
+
+/* Recorder for the authorized one-shot arm call (native seam). */
+void phy_set_cca_cnt(uint32_t value, uint32_t arm);
+uint32_t fake_cca_set_cnt_calls(void);
+uint32_t fake_cca_set_cnt_value(void);
+uint32_t fake_cca_set_cnt_arm(void);
 
 /* uart */
 void fake_uart_rx_push(const uint8_t *bytes, size_t length_bytes);

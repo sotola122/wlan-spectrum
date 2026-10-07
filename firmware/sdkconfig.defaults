@@ -6,3 +6,16 @@ CONFIG_LOG_DEFAULT_LEVEL_NONE=y
 CONFIG_FREERTOS_HZ=1000
 # app_main task stack: bounded JSON formatting + scheduling loop.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Snapshot I/Q capture (monitor_capture.c): link the SDK RF-test archive
+# that defines the private adctrig entry. The archive only defines symbols;
+# nothing runs unless monitor_capture_snapshot calls it.
+CONFIG_ESP_PHY_ENABLE_CERT_TEST=y
+
+# The 128 KiB IQ capture bank starts at 0x40820000; IRAM must shrink so
+# static data ends below it (bank_guard.ld fails the link otherwise).
+# CONFIG_ESP_WIFI_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_EXTRA_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_SLP_IRAM_OPT is not set
+# CONFIG_ESP_PHY_IRAM_OPT is not set

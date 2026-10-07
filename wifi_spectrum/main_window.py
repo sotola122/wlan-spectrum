@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
-    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -40,14 +39,30 @@ from . import theme, tlv
 from .bands import BAND_5, BAND_24, BANDS, channel_freq
 from .mock import MODE_LIVE, MODE_SWEEP, MockSource
 from .monitor_data import SCHEMA as MONITOR_SCHEMA
-from .monitor_data import MonitorState
-from .monitor_widget import DISCONNECTED_TEXT, WAITING_TEXT, MonitorWidget
+from .monitor_data import UTIL_CONFIDENCE, UTIL_SOURCE, MonitorState
 from .serial_link import SerialReader, available_ports
 from .theme import C
 
 theme.configure_pyqtgraph()
 
 WATERFALL_ROWS = 200
+
+# CONFIG resend while no matching ack has arrived: bounded, idempotent
+# (latest tuple only), cancelled by the fresh matching ack, detach, demo,
+# legacy fallback or source error. The post-ctrl gate log only showed a
+# missing ack on run1 and a recovery on the identical rerun - cause not
+# proven; the PTY test covers a device that loses its first CONFIG.
+CFG_RETRY_MS = 500
+CFG_MAX_RETRIES = 10
+
+# Source-visible status lines (moved from the removed monitor screen)
+WAITING_TEXT = "Waiting for configuration"
+DISCONNECTED_TEXT = "Disconnected — no device data"
+
+# Demo/legacy acquisition options; the RF path replaces these with the
+# runtime spectrum_caps lists.
+DEMO_FFT_SIZES = ["64", "128", "256", "512", "1024"]
+DEMO_RATES = ["20 MS/s", "40 MS/s"]
 
 # Backwards-compatible name used by __main__ in earlier versions
 apply_dark_theme = theme.apply_theme
@@ -135,6 +150,8 @@ class PlotCard(QFrame):
         t.setObjectName("cardTitle")
         cap = QLabel(caption)
         cap.setObjectName("caption")
+        self.title_lbl = t
+        self.cap_lbl = cap
         head.addWidget(t)
         head.addWidget(cap)
         head.addStretch(1)
@@ -158,6 +175,14 @@ class MainWindow(QMainWindow):
         self.resize(1480, 940)
 
         self.source = None              # SerialReader | MockSource | None
+        # Explicit source/capability state (replaces the old stack-index
+        # "is monitor view" check): none = no source, demo = MockSource,
+        # serial = real port. RF mode = serial with a valid spectrum ack.
+        self._source_kind = "none"
+        self._legacy = False            # serial device streaming legacy 0x01
+        self._rf_active = False         # current ack carries valid RF caps
+        self._rf_covered = np.zeros(0, dtype=bool)
+        self._rf_cycle: int | None = None
         self.monitor_state = MonitorState()
         self.mode = MODE_LIVE
         self.band = BAND_24
@@ -165,7 +190,14 @@ class MainWindow(QMainWindow):
         self.sweeps_done = 0
         self._dirty = False
         self._frames, self._fps, self._fps_t = 0, 0.0, time.monotonic()
-        self._util: dict[int, int] = {}
+        self._util: dict[int, float] = {}   # ch -> percent (int in demo)
+        # One bounded CONFIG-retry chain, owned by a single-shot QTimer:
+        # re-armed with the latest requested tuple on every change, stopped
+        # on ack/detach/demo/legacy/error (see _send_config/_retry_config).
+        self._cfg_timer = QTimer(self)
+        self._cfg_timer.setSingleShot(True)
+        self._cfg_timer.timeout.connect(self._retry_config)
+        self._cfg_attempts = 0
         self._ch_lines: list[pg.InfiniteLine] = []
 
         central = QWidget()
@@ -176,7 +208,7 @@ class MainWindow(QMainWindow):
         body = QHBoxLayout()
         body.setContentsMargins(20, 20, 20, 16)
         body.setSpacing(20)
-        body.addWidget(self._build_stack(), 1)
+        body.addWidget(self._build_plots(), 1)
         body.addWidget(self._build_right_panel())
         root.addLayout(body, 1)
         self.setCentralWidget(central)
@@ -184,6 +216,8 @@ class MainWindow(QMainWindow):
 
         self._set_band(BAND_24)
         self._on_mode_changed(0)
+        self._update_acquisition_controls()
+        self._update_power_units()
 
         self._render_timer = QTimer(self)        # throttle redraws to ~30 fps
         self._render_timer.timeout.connect(self._render)
@@ -281,19 +315,6 @@ class MainWindow(QMainWindow):
         return bar
 
     # ============================================================ plots
-    def _build_stack(self) -> QWidget:
-        """Demo plots and the real-device monitor view share one stack.
-
-        The initial view is the existing plot stack; a serial source switches
-        to the monitor view immediately, a legacy device falls back only when
-        actual Spectrum/ChannelUtil frames arrive.
-        """
-        self.monitor_widget = MonitorWidget(self.monitor_state)
-        self.plot_stack = QStackedWidget()
-        self.plot_stack.addWidget(self._build_plots())
-        self.plot_stack.addWidget(self.monitor_widget)
-        return self.plot_stack
-
     def _build_plots(self) -> QWidget:
         box = QWidget()
         lay = QVBoxLayout(box)
@@ -481,18 +502,36 @@ class MainWindow(QMainWindow):
         self.conn_lbl.style().polish(self.conn_lbl)
 
     # ============================================================ band / mode
+    def _init_display_arrays(self) -> None:
+        """(Re)initialise cur/peak/waterfall/coverage for the current
+        source and band. Real path: NaN everywhere until measured - gaps
+        stay gaps. Demo/legacy: the original floor background. Also
+        clears coverage, RF cycle tracking and utilization so no state
+        crosses a source, band, epoch or capability transition."""
+        info = BANDS[self.band]
+        floor = float(self.db_min.value())
+        real = self._real_path()
+        fill = np.nan if real else floor
+        self.cur = np.full(info.n_points, fill, dtype=np.float32)
+        self.peak = np.full(info.n_points, np.nan if real else -200.0,
+                            dtype=np.float32)
+        self.wf = np.full((WATERFALL_ROWS, info.n_points), fill,
+                          dtype=np.float32)
+        self._rf_covered = np.zeros(info.n_points, dtype=bool)
+        self._rf_cycle = None
+        self._util = {}
+        self._update_util_bars()
+        self._dirty = True
+
     def _set_band(self, band: int) -> None:
         self.band = band
         info = BANDS[band]
         self.freqs = np.linspace(info.f_start, info.f_stop, info.n_points)
         floor = float(self.db_min.value())
-        self.cur = np.full(info.n_points, floor, dtype=np.float32)
-        self.peak = np.full(info.n_points, -200.0, dtype=np.float32)
-        self.wf = np.full((WATERFALL_ROWS, info.n_points), floor, dtype=np.float32)
+        self._init_display_arrays()
         self._wf_rect = QRectF(info.f_start, 0, info.f_stop - info.f_start, WATERFALL_ROWS)
         self.wf_img.setImage(self.wf, autoLevels=False, levels=(floor, self.db_max.value()))
         self.wf_img.setRect(self._wf_rect)
-        self._util = {}
         self.sweeps_done = 0
         self._update_sweep_label()
 
@@ -530,8 +569,9 @@ class MainWindow(QMainWindow):
                 it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.ch_table.setItem(r, c, it)
         self._update_util_bars()
-        if self._real_monitor():
-            self._reset_monitor("Waiting for configuration")
+        if self._monitor_view():
+            self._reset_monitor(WAITING_TEXT)
+        self._update_power_units()
         self._send_config()
         self._dirty = True
 
@@ -540,8 +580,8 @@ class MainWindow(QMainWindow):
         self.sweeps_done = 0
         self._update_sweep_label()
         self._update_timing_controls()
-        if self._real_monitor():
-            self._reset_monitor("Waiting for configuration")
+        if self._monitor_view():
+            self._reset_monitor(WAITING_TEXT)
         self._send_config()
 
     def _reset_x(self) -> None:
@@ -555,52 +595,99 @@ class MainWindow(QMainWindow):
         self.spec_plot.getViewBox().setXRange(f - half, f + half, padding=0)
 
     # ============================================================ sources
-    def _real_monitor(self) -> bool:
-        """True while the real-device monitor view is active. A legacy serial
-        device that falls back to the demo plots is not a real monitor view,
-        so its provisional FFT/RBW controls behave like Demo again."""
-        return self.plot_stack.currentIndex() == 1
+    def _is_serial(self) -> bool:
+        return self._source_kind == "serial"
 
-    def _enter_real_view(self) -> None:
-        self._reset_monitor()
-        self.plot_stack.setCurrentIndex(1)
-        self._apply_real_controls(True)
+    def _monitor_view(self) -> bool:
+        """Serial source speaking the wifi-monitor/1 contract (not a legacy
+        0x01 device). Replaces the old stack-index check: config echoes,
+        dwell timing and capability sync all bind through this state."""
+        return self._source_kind == "serial" and not self._legacy
 
-    def _exit_real_view(self) -> None:
-        self.plot_stack.setCurrentIndex(0)
-        self._apply_real_controls(False)
+    def _real_path(self) -> bool:
+        """The real path renders measurements only: buffers stay NaN where
+        nothing has been measured (no fake floor, no zero-fill)."""
+        return self._source_kind == "serial" and not self._legacy
+
+    def _power_unit(self) -> str:
+        return "dBFS" if self._rf_active else "dBm"
 
     def _legacy_fallback(self) -> None:
-        """Old serial firmware without wifi-monitor/1: show the original
-        plots, but only when real Spectrum/ChannelUtil frames arrive."""
-        if self.plot_stack.currentIndex() == 0:
+        """Old serial firmware emitting demo-style 0x01/0x02 frames: keep
+        the shared plots, render like Demo, never enter RF mode."""
+        self._cfg_timer.stop()          # no monitor ack is coming now
+        if self._legacy:
             return
-        self.plot_stack.setCurrentIndex(0)
-        self._apply_real_controls(False)
+        self._legacy = True
+        self._rf_active = False
+        self._init_display_arrays()          # demo-style floor background
+        self._update_acquisition_controls()
+        self._update_power_units()
         self.statusBar().showMessage(
             "Device streams legacy spectrum frames; showing standard plots")
 
-    def _apply_real_controls(self, real: bool) -> None:
-        # FFT/sample-rate/RBW and the peak/waterfall toggles describe the
-        # mock RF model; real monitoring measures neither, so they are
-        # disabled instead of showing invented values. Demo restores them.
-        self.fft_combo.setEnabled(not real)
-        self.sr_combo.setEnabled(not real)
-        self.peak_chk.setEnabled(not real)
-        self.wf_chk.setEnabled(not real)
-        self.peak_reset_btn.setEnabled(not real)
-        self.channel_group.setVisible(not real)
+    def _set_combo_items(self, combo, items: list[str],
+                         select: str | None) -> None:
+        """Rebuild a combo from capability/demo options without emitting
+        spurious CONFIG frames (selection follows the device's effective
+        values, not a new user request)."""
+        if ([combo.itemText(i) for i in range(combo.count())] == items):
+            if select and combo.currentText() != select and select in items:
+                combo.blockSignals(True)
+                combo.setCurrentText(select)
+                combo.blockSignals(False)
+            return
+        current = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(items)
+        want = select if select in items else (
+            current if current in items else (items[0] if items else ""))
+        if want:
+            combo.setCurrentText(want)
+        combo.blockSignals(False)
+
+    def _update_acquisition_controls(self) -> None:
+        """FFT size / sample rate are ACQUISITION controls: bound to the
+        runtime spectrum_caps lists when RF is proven, Demo-like for the
+        mock and legacy paths, and honestly disabled for baseline
+        monitor-only firmware that has no RF at all. Display controls
+        (peak/waterfall/markers/range/zoom) are never gated."""
+        if self._rf_active:
+            caps = self.monitor_state.spectrum_caps or {}
+            eff = self.monitor_state.spectrum_effective or {}
+            sizes = [str(s) for s in caps.get("fft_sizes", [])]
+            rates = [f"{int(r['span_khz']) // 1000} MS/s"
+                     for r in caps.get("rate_codes", [])]
+            self._set_combo_items(self.fft_combo, sizes,
+                                  str(eff.get("fft_size", "")))
+            self._set_combo_items(
+                self.sr_combo, rates,
+                f"{int(eff.get('span_khz', 0)) // 1000} MS/s")
+            enabled = True
+        elif self._monitor_view():
+            enabled = False               # monitor-only FW: no FFT support
+        else:                              # demo, legacy, or no source
+            self._set_combo_items(self.fft_combo, list(DEMO_FFT_SIZES), None)
+            self._set_combo_items(self.sr_combo, list(DEMO_RATES), None)
+            enabled = True
+        self.fft_combo.setEnabled(enabled)
+        self.sr_combo.setEnabled(enabled)
         self._update_timing_controls()
         self._update_rbw()
 
     def _update_timing_controls(self) -> None:
-        # Real mode: sweep time is the hopping interval in Live as well.
-        self.sweep_time.setEnabled(self._real_monitor() or self.mode == MODE_SWEEP)
+        # Monitor/RF mode: sweep time is the hopping interval in Live too.
+        self.sweep_time.setEnabled(self._monitor_view()
+                                   or self.mode == MODE_SWEEP)
         self.sweep_count.setEnabled(self.mode == MODE_SWEEP)
 
     def _reset_monitor(self, message: str = WAITING_TEXT) -> None:
         self.monitor_state.reset()
-        self.monitor_widget.set_waiting(message)
+        self._rf_active = False
+        self.dev_lbl.setText(message)
+        self._update_acquisition_controls()
+        self._update_power_units()
 
     def _refresh_ports(self) -> None:
         cur = self.port_combo.currentText()
@@ -611,6 +698,7 @@ class MainWindow(QMainWindow):
 
     def _attach(self, src) -> None:
         src.spectrum.connect(self._on_spectrum)
+        src.spectrum_rf.connect(self._on_spectrum_rf)
         src.ch_util.connect(self._on_util)
         src.status.connect(self._on_status)
         src.error.connect(self._on_source_error)
@@ -620,17 +708,33 @@ class MainWindow(QMainWindow):
             # The initial CONFIG must wait until the port is actually open;
             # a write before open is silently dropped (no timer workarounds).
             src.opened.connect(self._send_config)
-            self._enter_real_view()
+            self._source_kind = "serial"
+            self._legacy = False
+            self._rf_active = False
+            self._reset_monitor(WAITING_TEXT)
+            self._init_display_arrays()      # NaN: no fake floor, no mock data
         else:
-            self._exit_real_view()
+            self._source_kind = "demo"
+            self._legacy = False
+            self._rf_active = False
+            self.monitor_state.reset()
+            self._init_display_arrays()      # clears any real-path traces
+            self._update_acquisition_controls()
+            self._update_power_units()
             self._send_config()            # MockSource writes immediately
 
     def _detach(self) -> None:
+        self._cfg_timer.stop()          # no retry may outlive this source
+        self._cfg_attempts = 0
+        was_serial = self._source_kind == "serial"
         if self.source is not None:
             src, self.source = self.source, None
             src.stop()
-            for sig, slot in ((src.spectrum, self._on_spectrum), (src.ch_util, self._on_util),
-                              (src.status, self._on_status), (src.error, self._on_source_error),
+            for sig, slot in ((src.spectrum, self._on_spectrum),
+                              (src.spectrum_rf, self._on_spectrum_rf),
+                              (src.ch_util, self._on_util),
+                              (src.status, self._on_status),
+                              (src.error, self._on_source_error),
                               (src.stats, self._on_stats)):
                 with contextlib.suppress(RuntimeError, TypeError):
                     sig.disconnect(slot)
@@ -639,7 +743,12 @@ class MainWindow(QMainWindow):
                     src.opened.disconnect(self._send_config)
             src.deleteLater()
         self._set_conn("Disconnected")
+        if was_serial:
+            self._init_display_arrays()     # blank the real path fully
         self._reset_monitor(DISCONNECTED_TEXT)
+        self._source_kind = "none"
+        self._legacy = False
+        self._rf_active = False
 
     def _on_demo_toggled(self, on: bool) -> None:
         if on:
@@ -683,6 +792,7 @@ class MainWindow(QMainWindow):
     def _on_source_error(self, msg: str) -> None:
         self.statusBar().showMessage(msg)
         if isinstance(self.sender(), SerialReader):
+            self._cfg_timer.stop()      # dead source: cancel the chain
             self.connect_btn.setChecked(False)
             self._set_conn("Error", "err")
 
@@ -696,10 +806,38 @@ class MainWindow(QMainWindow):
         fields = (self.mode, self.band, self.sweep_time.value(),
                   int(self.fft_combo.currentText()),
                   int(self.sr_combo.currentText().split()[0]) * 1000)
-        if self._real_monitor():
+        if self._monitor_view():
             # an echo of these five fields is the device's acknowledgement
             self.monitor_state.request(*fields)
         self.source.write(tlv.encode_config(*fields))
+        if self._monitor_view() and isinstance(self.source, SerialReader):
+            # one bounded resend chain: start() re-arms with the LATEST
+            # tuple; stop() on ack/detach/demo/legacy/error cancels
+            self._cfg_attempts = 0
+            self._cfg_timer.start(CFG_RETRY_MS)
+        else:
+            self._cfg_timer.stop()
+
+    def _retry_config(self) -> None:
+        """Bounded resend of the latest CONFIG until a fresh matching ack.
+        A single owned QTimer is re-armed with the latest requested tuple
+        (stop/re-arm on every change or detach), and the chain ends itself
+        after CFG_MAX_RETRIES with a visible failure."""
+        if not (isinstance(self.source, SerialReader)
+                and self._monitor_view()
+                and not self.monitor_state.ready):
+            return                      # stale chain: never resends
+        if self._cfg_attempts >= CFG_MAX_RETRIES:
+            self.statusBar().showMessage(
+                f"No configuration acknowledgement after "
+                f"{CFG_MAX_RETRIES} retries - device not responding?")
+            return                      # single-shot: the chain ends here
+        fields = self.monitor_state.requested
+        if fields is None:
+            return
+        self._cfg_attempts += 1
+        self.source.write(tlv.encode_config(*fields))   # idempotent tuple
+        self._cfg_timer.start(CFG_RETRY_MS)
 
     def _on_play_toggled(self, on: bool) -> None:
         self.playing = on
@@ -711,7 +849,9 @@ class MainWindow(QMainWindow):
 
     # ============================================================ data in
     def _on_spectrum(self, msg: tlv.Spectrum) -> None:
-        if self._real_monitor():
+        if self._rf_active:
+            return                   # RF mode never falls back on 0x01
+        if self._is_serial():
             self._legacy_fallback()
         if not self.playing or len(msg.dbm) < 2:
             return
@@ -741,10 +881,40 @@ class MainWindow(QMainWindow):
         self.wf = np.roll(self.wf, 1, axis=0)
         self.wf[0] = self.cur
 
+    def _on_spectrum_rf(self, msg: tlv.SpectrumRf) -> None:
+        """0x04 SPECTRUM_RF: live mode renders each frame immediately;
+        sweep mode stages in MonitorState until the STATUS cycle marker
+        (handled in _on_monitor_status)."""
+        if not self._rf_active or not self.playing:
+            return
+        if not self.monitor_state.accept_rf(msg):
+            return                   # stale epoch/band or a closed cycle
+        self._rf_apply_frames([msg])
+        self._push_row()             # live: one waterfall row per frame
+
+    def _sync_util_from_state(self) -> None:
+        """Rebuild the display map from MonitorState's published util set
+        (live per channel, sweep flushed at the marker, gaps on missing/
+        failed/capability change). Float percent keeps the raw fraction for
+        bars/data; labels round only at formatting time."""
+        self._util = {ch: 100.0 * s["busy"] / s["total"]
+                      for ch, s in self.monitor_state.util_samples.items()}
+        self._update_util_bars()
+
     def _on_util(self, msg: tlv.ChannelUtil) -> None:
-        if self._real_monitor():
-            self._legacy_fallback()
-        if msg.band != self.band or not self.playing:
+        # RF mode takes utilization ONLY from the epoch'd STATUS channel
+        # envelope (contract: Sampled PHY CCA). A 0x02 carries no epoch and
+        # can never be this device's actual source - reject ALL of them so
+        # an unproven frame cannot overwrite measured util. Demo and an
+        # established legacy 0x01 stream keep the original 0x02 behavior.
+        if self._rf_active:
+            return
+        if self._source_kind == "serial":
+            render = (self._legacy and self.playing
+                      and msg.band == self.band)
+        else:                              # demo: original behavior
+            render = self.playing and msg.band == self.band
+        if not render:
             return
         self._util = dict(msg.util)
         self._update_util_bars()
@@ -761,25 +931,111 @@ class MainWindow(QMainWindow):
         if event in ("channel", "cycle") and not self.playing:
             return          # paused: measurements are gated before acceptance;
                             # config/error status still processes while paused
+        old_epoch = self.monitor_state.epoch
         try:
             changed = self.monitor_state.accept(data)
         except ValueError as exc:
             self.statusBar().showMessage(f"Rejected monitor payload: {exc}")
             return
-        if not changed:
+        if not changed and event != "channel_error":
+            # a repeated channel error still invalidates published util
             return
-        self.monitor_widget.refresh()
         if event == "config":
-            self.dev_lbl.setText(
-                f"{data.get('fw', '?')} · {data.get('chip', '?')} · "
-                f"{data.get('country', '?')} · epoch {data.get('epoch')}")
-        elif event == "cycle" and self.playing and self.mode == MODE_SWEEP:
+            self._cfg_timer.stop()   # fresh matching ack cancels the chain
+            self._sync_rf_state(old_epoch)
+            self._update_dev_label(data)
+        elif event == "cycle" and self.mode == MODE_SWEEP:
             self.sweeps_done += 1
             self._update_sweep_label()
             limit = self.sweep_count.value()
             if limit and self.sweeps_done >= limit:
                 self.play_btn.setChecked(False)
                 self.statusBar().showMessage(f"Completed {limit} sweeps")
+        elif event in ("error", "channel_error"):
+            # device-reported faults stay visible without the old widget
+            self.statusBar().showMessage(
+                f"Device error: {self.monitor_state.last_error}")
+        if event in ("config", "channel", "cycle", "channel_error"):
+            # the display is rebuilt from MonitorState's published util set:
+            # live per channel, sweep flushed at the marker, gaps on
+            # missing/failed/capability change - never a stale percent
+            self._sync_util_from_state()
+        if event == "cycle" and self._rf_active:
+            # The STATUS cycle marker is the ONLY cycle authority for RF
+            # data (never a frequency-position heuristic): staged sweep
+            # frames flush here, then unclosed points become gaps.
+            flushed = self.monitor_state.rf_flushed
+            if flushed:
+                self._rf_apply_frames(flushed)
+            # Close/mask the cycle BEFORE copying into waterfall history,
+            # so a row never contains another cycle's leftover values.
+            self._rf_close_cycle()
+            if flushed or self.mode == MODE_SWEEP:
+                # exactly one history row per completed sweep cycle - an
+                # all-NaN row honestly records a cycle with no captures
+                self._push_row()
+
+    def _sync_rf_state(self, old_epoch: int | None) -> None:
+        """Re-derive RF mode from the current ack and clear every buffer
+        that could carry data across an epoch or capability boundary."""
+        was_active = self._rf_active
+        self._rf_active = self.monitor_state.rf_ready
+        if self._rf_active != was_active:
+            if self._rf_active:
+                self._legacy = False   # capability ack supersedes legacy claim
+            self._init_display_arrays()
+        if old_epoch is not None and self.monitor_state.epoch != old_epoch:
+            self._init_display_arrays()   # new epoch: no stale traces
+        self._update_acquisition_controls()
+        self._update_power_units()
+
+    def _update_dev_label(self, data: dict) -> None:
+        st = self.monitor_state
+        parts = [str(data.get("fw", "?")), str(data.get("chip", "?")),
+                 f"epoch {st.epoch}", f"dwell {st.dwell_ms} ms"]
+        if st.rf_ready:
+            eff = st.spectrum_effective or {}
+            span = int(eff.get("span_khz", 0))
+            parts.append(
+                f"RF FFT {eff.get('fft_size')} @ {span / 1000:.0f} MS/s")
+        else:
+            parts.append("spectrum n/a")
+        parts.append("util available" if st.utilization_available
+                     else "util n/a")
+        if st.tx_dropped:
+            parts.append(f"tx drop {st.tx_dropped}")
+        self.dev_lbl.setText(" · ".join(parts))
+
+    def _rf_begin_cycle(self, cycle: int) -> None:
+        # If a STATUS cycle marker was lost, the first frame of the next
+        # cycle closes the previous coverage instead of extending it.
+        if self._rf_cycle is None:
+            self._rf_cycle = cycle
+        elif cycle != self._rf_cycle:
+            self._rf_close_cycle()
+            self._rf_cycle = cycle
+
+    def _rf_close_cycle(self) -> None:
+        # Channels without a frame in the closing cycle become gaps:
+        # no zero-fill, no interpolation, no synthetic floor.
+        self.cur[~self._rf_covered] = np.nan
+        self._rf_covered[:] = False
+        self._rf_cycle = None
+        self._dirty = True
+
+    def _rf_apply_frames(self, frames: list[tlv.SpectrumRf]) -> None:
+        for f in frames:
+            f_mhz = f.freqs
+            mask = (self.freqs >= f_mhz[0]) & (self.freqs <= f_mhz[-1])
+            if not mask.any():
+                continue               # frame outside the display range
+            self._rf_begin_cycle(f.cycle)
+            self.cur[mask] = np.interp(self.freqs[mask], f_mhz,
+                                       f.power_dbfs)
+            np.fmax(self.peak, self.cur, out=self.peak)  # NaN-safe max-hold
+            self._rf_covered |= mask
+            self._frames += 1
+        self._dirty = True
 
     def _on_stats(self, rx: int, errors: int) -> None:
         self.rx_lbl.setText(f"{rx / 1024:.1f} KiB" if rx > 1024 else f"{rx} B")
@@ -817,49 +1073,98 @@ class MainWindow(QMainWindow):
         self.util_texts = []
         if self._util:
             font = theme.mono_font(7.5)
-            for x, h in zip(xs, hs, strict=True):
-                t = pg.TextItem(f"{h}", color=C["body"], anchor=(0.5, 1))
+            for x, h, ch in zip(xs, hs, info.channels, strict=True):
+                if ch not in self._util:
+                    continue        # gap: no label that claims a value
+                t = pg.TextItem(f"{h:.0f}", color=C["body"], anchor=(0.5, 1))
                 t.setFont(font)
                 t.setPos(x, h)
                 self.util_plot.addItem(t)
                 self.util_texts.append(t)
         for r, ch in enumerate(info.channels):
             it = self.ch_table.item(r, 2)
-            if it is not None:
-                it.setText(f"{self._util[ch]} %" if ch in self._util else "—")
+            if it is None:
+                continue
+            if ch in self._util:
+                it.setText(f"{self._util[ch]:.0f} %")
+                sample = self.monitor_state.util_samples.get(ch)
+                it.setToolTip(
+                    f"Sampled PHY CCA (experimental): busy {sample['busy']} / "
+                    f"total {sample['total']} ticks · window_us_upper "
+                    f"{sample['window_us_upper']} µs" if sample else "")
+            else:
+                it.setText("—")
+                it.setToolTip(
+                    "Sampled PHY CCA (experimental): no valid sample (gap)"
+                    if self._rf_active else "")
 
     def _update_peak_column(self) -> None:
         info = BANDS[self.band]
         for r, ch in enumerate(info.channels):
             fc = channel_freq(self.band, ch)
             m = np.abs(self.freqs - fc) <= 10
+            vals = self.peak[m] if m.any() else self.peak[:0]
+            vals = vals[np.isfinite(vals)]
             it = self.ch_table.item(r, 3)
-            if it is not None and m.any() and self.peak[m].max() > -199:
-                it.setText(f"{self.peak[m].max():.0f}")
+            if it is not None:
+                # always write: NaN / sentinel (-200) shows the gap "—"
+                it.setText(f"{vals.max():.0f}"
+                           if vals.size and vals.max() > -199 else "—")
 
     # ============================================================ UI helpers
     def _apply_db_range(self) -> None:
         lo, hi = self.db_min.value(), self.db_max.value()
-        self.db_min_lbl.setText(f"{lo} dBm")
-        self.db_max_lbl.setText(f"{hi} dBm")
+        unit = self._power_unit()
+        self.db_min_lbl.setText(f"{lo} {unit}")
+        self.db_max_lbl.setText(f"{hi} {unit}")
         self.spec_plot.getViewBox().setYRange(lo, hi, padding=0)
         self.wf_img.setLevels((lo, hi))
         self._dirty = True
 
     def _update_rbw(self) -> None:
-        if self._real_monitor():
-            self.rbw_lbl.setText("N/A — no RF FFT")
-            return
-        sr = int(self.sr_combo.currentText().split()[0])
-        fft = int(self.fft_combo.currentText())
-        self.rbw_lbl.setText(f"{sr * 1000 / fft:.1f} kHz")
+        if self._rf_active:
+            # RBW = effective span / effective bins (device-reported, never
+            # what the GUI asked for)
+            eff = self.monitor_state.spectrum_effective or {}
+            span = int(eff.get("span_khz", 0))
+            fft = int(eff.get("fft_size", 0))
+            self.rbw_lbl.setText(f"{span / fft:.1f} kHz"
+                                 if span and fft else "—")
+        elif self._monitor_view():
+            self.rbw_lbl.setText("N/A — no RF FFT")   # baseline monitor FW
+        else:
+            sr = int(self.sr_combo.currentText().split()[0])
+            fft = int(self.fft_combo.currentText())
+            self.rbw_lbl.setText(f"{sr * 1000 / fft:.1f} kHz")
+
+    def _update_power_units(self) -> None:
+        """dBFS vs dBm labelling across axis, captions, table header and
+        dB-range readouts. RF and Demo never share a unit string."""
+        unit = self._power_unit()
+        theme.axis_label(self.spec_plot, "left", unit)
+        self.spec_card.cap_lbl.setText(f"POWER · {unit}")
+        self.ch_table.setHorizontalHeaderLabels(
+            ["CH", "MHz", "Util",
+             "Peak dBFS" if self._rf_active else "Peak"])
+        self.util_card.cap_lbl.setText(
+            "UTILIZATION · % · UNAVAILABLE"
+            if self._rf_active and not self.monitor_state.utilization_available
+            else "UTILIZATION · %")
+        if self._rf_active and self.monitor_state.utilization_available:
+            self.util_card.setToolTip(
+                f"Sampled PHY CCA (experimental) · source={UTIL_SOURCE} · "
+                f"confidence={UTIL_CONFIDENCE} · cell tooltip: raw "
+                "busy/total ticks + window_us_upper µs")
+        else:
+            self.util_card.setToolTip("")
+        self._apply_db_range()
 
     def _update_sweep_label(self, *_) -> None:
         limit = self.sweep_count.value()
         self.sweep_lbl.setText(f"{self.sweeps_done} / {limit if limit else '∞'}")
 
     def _reset_peak(self) -> None:
-        self.peak[:] = -200
+        self.peak[:] = np.nan if self._real_path() else -200
         self._dirty = True
 
     def _toggle_waterfall(self, on: bool) -> None:
@@ -878,8 +1183,13 @@ class MainWindow(QMainWindow):
         pt = vb.mapSceneToView(pos)
         i = int(np.clip(np.searchsorted(self.freqs, pt.x()), 0, len(self.freqs) - 1))
         self.vline.setPos(self.freqs[i])
-        self.readout.setText(f"{self.freqs[i]:.1f} MHz  ·  {self.cur[i]:.1f} dBm  ·  "
-                             f"peak {self.peak[i]:.1f} dBm")
+        unit = self._power_unit()
+        cur = self.cur[i]
+        pk = self.peak[i]
+        cur_s = f"{cur:.1f} {unit}" if np.isfinite(cur) else "—"
+        pk_s = f"{pk:.1f} {unit}" if np.isfinite(pk) else "—"
+        self.readout.setText(
+            f"{self.freqs[i]:.1f} MHz  ·  {cur_s}  ·  peak {pk_s}")
 
     def closeEvent(self, ev) -> None:
         self._detach()

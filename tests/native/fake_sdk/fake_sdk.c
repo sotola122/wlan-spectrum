@@ -26,13 +26,94 @@ const char *esp_err_to_name(esp_err_t code) {
 
 /* ------------------------------------------------------------ esp_timer */
 static int64_t g_time_us;
+static uint32_t g_time_step_us;        /* gated auto-step, default off */
+static uint32_t g_cca_step_a;
+static uint32_t g_cca_step_b;
+static uint32_t g_fake_cca_ctrl;        /* control-word fake (0x600a7c58) */
 
 int64_t esp_timer_get_time(void) {
-    return g_time_us;
+    int64_t v = g_time_us;
+    g_time_us += g_time_step_us;       /* advances only when gated on */
+    return v;
+}
+
+void fake_time_autostep(uint32_t step_us) {
+    g_time_step_us = step_us;
+}
+
+void fake_cca_step(uint32_t a_step, uint32_t b_step) {
+    g_cca_step_a = a_step;
+    g_cca_step_b = b_step;
 }
 
 void fake_time_advance_us(int64_t delta_us) {
     g_time_us += delta_us;
+}
+
+/* ------------------------------------------------------- CCA telemetry fake */
+static uint32_t g_fake_cca_a;
+static uint32_t g_fake_cca_b;
+static uint32_t g_fake_cca_flag;
+
+uint32_t phy_get_cca_cnt(uint32_t out[2]) {
+    /* A saturates exactly at the configured limit (observed device
+     * behavior: A stops on the limit); B is NOT clamped (device B could
+     * exceed A — the strict busy<=total rule then marks invalid). The
+     * returned flag mirrors the observed done state: 1 once A hit the
+     * configured limit, 0 while counting (first-sample reset proof uses
+     * flag==0 && A<limit). */
+    uint32_t limit = g_fake_cca_ctrl & 0x07ffffffu;
+    out[0] = g_fake_cca_a;
+    out[1] = g_fake_cca_b;
+    g_fake_cca_a += g_cca_step_a;
+    if (g_fake_cca_a > limit) {
+        g_fake_cca_a = limit;
+    }
+    g_fake_cca_b += g_cca_step_b;
+    return g_fake_cca_a >= limit ? 1u : 0u;
+}
+
+void fake_cca_set(uint32_t a, uint32_t b, uint32_t flag) {
+    g_fake_cca_a = a;
+    g_fake_cca_b = b;
+    g_fake_cca_flag = flag;
+}
+
+uint32_t fake_cca_ctrl_read(void) {
+    return g_fake_cca_ctrl;
+}
+
+void fake_cca_ctrl_set(uint32_t value) {
+    g_fake_cca_ctrl = value;
+}
+
+static uint32_t g_fake_set_cnt_calls;
+static uint32_t g_fake_set_cnt_value;
+static uint32_t g_fake_set_cnt_arm;
+
+void phy_set_cca_cnt(uint32_t value, uint32_t arm) {
+    g_fake_set_cnt_calls++;
+    g_fake_set_cnt_value = value;
+    g_fake_set_cnt_arm = arm;
+    /* Mirror the exact SDK write semantics (disasm): keep bits27..31,
+     * replace bits0..26; arm ORs bits27|28. */
+    g_fake_cca_ctrl = (g_fake_cca_ctrl & 0xf8000000u) |
+                      (value & 0x07ffffffu);
+    if (arm != 0) {
+        g_fake_cca_ctrl |= 0x18000000u;
+    }
+}
+
+uint32_t fake_cca_set_cnt_calls(void) {
+    return g_fake_set_cnt_calls;
+}
+
+uint32_t fake_cca_set_cnt_value(void) {
+    return g_fake_set_cnt_value;
+}
+
+uint32_t fake_cca_set_cnt_arm(void) {
+    return g_fake_set_cnt_arm;
 }
 
 /* ------------------------------------------------------------- netif/event */

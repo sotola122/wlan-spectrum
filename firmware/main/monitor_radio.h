@@ -44,4 +44,8 @@ esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel);
  * excluded from observed_ms. */
 void monitor_radio_finish(MonitorObservation *out);
 
+/* (diagnostic cca poll / trace replay / repeat-window decls removed —
+ * the feature is a per-valid-dwell armed one-shot computed entirely inside
+ * begin/finish; evidence raw logs remain in evidence/cca_*.) */
+
 #endif /* MONITOR_RADIO_H */

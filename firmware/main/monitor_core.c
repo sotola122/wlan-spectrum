@@ -171,6 +171,24 @@ size_t monitor_band_channels(uint8_t band, uint8_t *out_channels,
     return count;
 }
 
+uint32_t monitor_channel_center_khz(uint8_t band, uint8_t channel) {
+    uint8_t channels[MONITOR_MAX_CHANNELS];
+    size_t count = monitor_band_channels(band, channels, sizeof(channels));
+    bool member = false;
+    for (size_t i = 0; i < count; i++) {
+        if (channels[i] == channel) {
+            member = true;
+            break;
+        }
+    }
+    if (!member) {
+        return 0;
+    }
+    /* 2.4 GHz: ch 1 -> 2412000 kHz; 5 GHz JP list: ch 36 -> 5180000 kHz. */
+    return band == 0 ? 2407000u + 5000u * channel
+                     : 5000000u + 5000u * channel;
+}
+
 bool monitor_parse_access_point(const uint8_t *frame, size_t frame_length_bytes,
                                 MonitorAccessPoint *out) {
     if (frame == NULL || out == NULL || frame_length_bytes < 36) {
@@ -419,6 +437,38 @@ static bool json_array_add_number(cJSON *array, double value) {
     return true;
 }
 
+static bool json_add_object(cJSON *object, const char *name, cJSON **out) {
+    cJSON *node = cJSON_CreateObject();
+    if (!json_attach(object, name, node)) {
+        return false;
+    }
+    *out = node;
+    return true;
+}
+
+/* One rate_caps entry: {"code": k, "span_khz": v} (handoff v2.1; hosts
+ * match rate_code against `code`, never array position). */
+static bool json_array_add_rate_code(cJSON *array, double code,
+                                     double span_khz) {
+    if (array == NULL) {
+        return false;
+    }
+    cJSON *node = cJSON_CreateObject();
+    if (node == NULL) {
+        return false;
+    }
+    bool ok = json_add_number(node, "code", code) &&
+              json_add_number(node, "span_khz", span_khz);
+    if (!ok) {
+        cJSON_Delete(node);
+        return false;
+    }
+    if (!json_attach_array(array, node)) {
+        return false;                       /* attach frees on failure */
+    }
+    return true;
+}
+
 /* Print the tree into dst (all-or-nothing) and free it. Returns the body
  * length or 0 on any failure; dst is unspecified when 0 is returned. */
 static size_t json_print_and_free(cJSON *root, bool ok, char *dst,
@@ -469,9 +519,61 @@ size_t monitor_format_config_event(char *dst, size_t capacity_bytes,
     for (size_t i = 0; ok && i < event->channel_count; i++) {
         ok = json_array_add_number(channels, event->channels[i]);
     }
-    ok = ok && json_add_bool(root, "spectrum", false);
-    ok = ok && json_add_bool(root, "cca", false);
-    ok = ok && json_add_bool(root, "fft_supported", false);
+    /* Spectrum capability block (evidence/spectrum-handoff.md v2.1):
+     * booleans are truth, the object fields are the effective values the
+     * firmware will actually produce — never a fabricated echo. */
+    ok = ok && json_add_bool(root, "spectrum", event->spectrum_available);
+    ok = ok && json_add_bool(root, "cca", event->utilization_available);
+    ok = ok && json_add_bool(root, "fft_supported", event->spectrum_available);
+    if (ok && event->spectrum_available) {
+        cJSON *caps = NULL;
+        ok = json_add_object(root, "spectrum_caps", &caps);
+        ok = ok && json_add_string(caps, "source", "c5_snapshot_iq_fft");
+        cJSON *sizes = NULL;
+        ok = ok && json_add_array(caps, "fft_sizes", &sizes);
+        static const uint16_t k_fft_sizes[] = {64, 128, 256, 512, 1024};
+        for (size_t i = 0; ok && i < sizeof(k_fft_sizes) / sizeof(k_fft_sizes[0]);
+             i++) {
+            ok = json_array_add_number(sizes, k_fft_sizes[i]);
+        }
+        cJSON *rates = NULL;
+        ok = ok && json_add_array(caps, "rate_codes", &rates);
+        /* Proven-subset order is irrelevant; hosts match on code. */
+        ok = ok && json_array_add_rate_code(rates, 1, 40000);
+        ok = ok && json_array_add_rate_code(rates, 2, 20000);
+        ok = ok && json_add_string(caps, "bin_unit", "centi_dbfs");
+        cJSON *effective = NULL;
+        ok = ok && json_add_object(root, "spectrum_effective", &effective);
+        ok = ok && json_add_number(effective, "fft_size",
+                                   event->effective_fft_size);
+        ok = ok && json_add_number(effective, "rate_code",
+                                   event->effective_rate_code);
+        ok = ok && json_add_number(effective, "span_khz",
+                                   event->effective_span_khz);
+    }
+    /* Utilization capability from boot (contract FINAL): available=true
+     * declares SUPPORT; per-dwell validity is the presence of the util
+     * object in the channel event, never this config latch. A packet rate
+     * or FFT energy must never become a percentage. */
+    if (ok) {
+        cJSON *util = NULL;
+        ok = json_add_object(root, "utilization", &util);
+        ok = ok && json_add_bool(util, "available",
+                                 event->utilization_available);
+        if (event->utilization_available) {
+            ok = ok && json_add_string(util, "source",
+                                       "c5_v6.0.3_phy_cca_cnt");
+            ok = ok && json_add_string(util, "confidence",
+                                       "experimental_sampled");
+            ok = ok && json_add_string(util, "label",
+                                       "sampled PHY CCA (experimental); "
+                                       "NAV equivalence not established; "
+                                       "one armed one-shot, not the dwell");
+        } else {
+            ok = ok && json_add_string(util, "blocker",
+                                       "cca_semantics_unproven");
+        }
+    }
     ok = ok && json_add_number(root, "tx_dropped", event->tx_dropped);
     return json_print_and_free(root, ok, dst, capacity_bytes);
 }
@@ -532,7 +634,24 @@ size_t monitor_format_channel_event(char *dst, size_t capacity_bytes,
     }
     ok = ok && json_add_number(root, "ap_dropped",
                                obs->access_points_dropped);
-    return json_print_and_free(root, ok, dst, capacity_bytes);
+    /* CCA utilization (contract FINAL v1, evidence/spectrum-cca-contract-
+     * final.md): ENDPOINT one-shot, strict validity, truthful gap. Host
+     * computes 100*busy/total; no pairs, no frac here. */
+    if (ok && obs->util_valid && obs->util_total > 0 &&
+        obs->util_total <= 0x07ffffffu &&
+        obs->util_busy <= obs->util_total &&
+        obs->util_window_us_upper > 0 &&
+        obs->util_window_us_upper <= 5000u) {
+        cJSON *u = NULL;
+        ok = json_add_object(root, "util", &u);
+        ok = ok && json_add_string(u, "source", "c5_v6.0.3_phy_cca_cnt");
+        ok = ok && json_add_string(u, "confidence", "experimental_sampled");
+        ok = ok && json_add_number(u, "busy", obs->util_busy);
+        ok = ok && json_add_number(u, "total", obs->util_total);
+        ok = ok && json_add_number(u, "window_us_upper",
+                                   obs->util_window_us_upper);
+    }
+        return json_print_and_free(root, ok, dst, capacity_bytes);
 }
 
 size_t monitor_format_cycle_event(char *dst, size_t capacity_bytes,

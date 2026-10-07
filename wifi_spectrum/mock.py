@@ -147,6 +147,7 @@ class MockSource(QObject):
     """In-process demo source with the same signals as ``SerialReader``."""
 
     spectrum = Signal(object)
+    spectrum_rf = Signal(object)    # never emitted: Demo has no RF path
     ch_util = Signal(object)
     status = Signal(object)
     error = Signal(str)

@@ -140,11 +140,108 @@ QT_QPA_PLATFORM=offscreen make test
 uv run python scripts/monitor_smoke.py --self-test
 ```
 
-The test suite covers framing/CRC, CONFIG, core observation/state handling, Qt monitor views, serial connection behavior and the smoke checker.
+The test suite covers framing/CRC, CONFIG, core observation/state handling, FFT normalization against an independent NumPy oracle, shared Qt RF/Demo views, serial connection behavior and smoke checkers.
 Offscreen Qt tests and POSIX pseudo-terminals do not constitute real RF or Windows validation.
 On Windows, set `QT_QPA_PLATFORM` with PowerShell syntax; POSIX-only PTY tests cannot verify COM hardware there.
 
+### Windows PC validation
+
+Run the following from PowerShell in the repository root. The Windows execution is a separate check; the Linux results above do not establish it.
+The host-only test selection excludes `test_firmware_core`, which requires a compatible native C compiler, sanitizer support and the downloaded cJSON source. Missing native prerequisites cause errors rather than automatic skips.
+
+```powershell
+uv sync
+uv run python -m unittest tests.test_tlv_crc tests.test_serial_config tests.test_monitor_data tests.test_monitor_widget tests.test_monitor_smoke tests.test_rf_smoke tests.test_rf_harness tests.test_fw_build
+uv run wifi-spectrum --demo
+```
+
+For headless Qt tests, set `$env:QT_QPA_PLATFORM="offscreen"`; leave that variable unset when checking the desktop UI.
+POSIX PTY integration tests are skipped on Windows. The GUI harness's `--self-test` is also POSIX-only; use its real-port mode below on Windows.
+
+The tested USB-UART bridge is CP2102N. Install its CP210x driver if needed and identify the COM port in Device Manager.
+Close the Demo window, start `uv run wifi-spectrum`, select the COM port and connect at 921600 baud.
+After checking the GUI, close it before running these commands sequentially, replacing `COM5` with the actual port:
+
+```powershell
+uv run python scripts/rf_spectrum_smoke.py --port COM5 --mode live --band 0 --seconds 60
+uv run python scripts/rf_spectrum_smoke.py --port COM5 --mode live --band 1 --seconds 60
+uv run python scripts/rf_gui_harness.py --port COM5 --baud 921600 --ready-timeout 30 --shots shots-win
+```
+
+The console smoke test does not need a display; the GUI harness uses Qt and saves screenshots.
+Only one process may own the COM port at a time. The [Windows wslc build](#build-with-windows-wslc) is a separate firmware-toolchain check.
+
 ## Hardware verification
+
+### RF and sampled-CCA acceptance
+
+The final sampled-CCA implementation was built with EIM and Podman on ESP-IDF v6.0.3. The EIM application image programmed and hash-verified over CP2102N USB-UART has SHA-256 `09af9396660752dc64bf685362f945f017a0feb10e9b940488516b4a7b271971`.
+The following tests used that running image and frozen host checkers at 921600 baud:
+
+| Band | Mode | Duration | RF frames | Valid CCA samples | Cycle markers | Exit |
+|---|---|---:|---:|---:|---:|---:|
+| 2.4 GHz | Live | 60 s | 469 | 448 | 36 | 0 |
+| 2.4 GHz | Sweep | 60 s | 468 | 452 | 36 | 0 |
+| 5 GHz | Live | 60 s | 468 | 461 | 23 | 0 |
+| 5 GHz | Sweep | 60 s | 468 | 467 | 23 | 0 |
+| 2.4 GHz | Sweep | 600 s | 4693 | 4505 | 361 | 0 |
+| 5 GHz | Sweep | 600 s | 4684 | 4645 | 234 | 0 |
+
+All six runs passed post-acknowledgement parser, RF coverage and sampled-CCA validation. Valid CCA samples need not equal the RF-frame count: invalid counter windows are omitted, not replaced with zero. The ten-minute runs reported 3 and 176 dropped AP sightings respectively; the AP observation queue is bounded and is not lossless.
+
+The physical-device GUI harness passed all 11 steps and exited zero. It verified the shared spectrum/current/peak/waterfall layout, display controls, FFT/rate changes, finite Sweep count, both bands, pause/resume, reconnect and return to Demo. It also checked actual raw-counter ratios against utilization bars and table cells, including the window metadata in tooltips, in 2.4 GHz Live, Sweep and 5 GHz Live. Both bands accumulated 31 received-data-driven waterfall rows before their screenshots, which were visually inspected. This was a Linux offscreen `MainWindow`/`SerialReader` test against the board, not a synthetic source or Windows desktop test.
+
+The final combined suite passed 226 tests, including 34 firmware/native test entries; scoped Pyright and Ruff checks passed. The RF smoke self-test passed 32 cases, and the synthetic PTY GUI test passed separately. Regression tests include lost initial CONFIG, bounded ACK retries, missing cycle markers, Sweep publication timing, rejected legacy utilization frames, invalid counter data and frozen-clock polling termination.
+
+These results verify the implemented data path and display behavior. CCA remains an experimental sampled PHY interpretation, not a calibrated or whole-dwell airtime measurement; FFT power remains relative dBFS. The UART stall limitation described below still applies. Windows validation belongs to the separate Windows procedure, and JTAG breakpoint verification is not covered by this USB-UART acceptance.
+
+The local evidence is retained under `.hermes/agent-sessions/pi/2026-10-06-wifi-monitor/evidence/`: `cca-accept-gate-*.log`, `cca-accept-600s-band{0,1}.log`, `cca-accept-gui.log` and `cca-accept-gui-shots/`. Host logs and the frozen checker hashes are in the adjacent Python session's evidence directory. These session artifacts are intentionally Git-ignored.
+
+### RF spectrum acceptance
+
+These results describe the initial RF implementation, before the subsequent sampled-CCA and CONFIG-retry additions. They are retained as a separate acceptance baseline, not attributed to a newer image.
+
+The RF implementation has built with EIM and Podman using ESP-IDF v6.0.3, and has been programmed over USB-UART with image-hash verification.
+A 90-second physical-device probe received 657 RF frames (448 on 2.4 GHz, 209 on 5 GHz) and 44 cycle events.
+It exercised FFT 64/512 and 20/40 MS/s configuration changes, with zero channel errors, RF decode errors, CRC rejects, discarded bytes after synchronization, or reported firmware TX drops.
+This establishes snapshot acquisition and transport on the connected board, not calibrated RF accuracy.
+The final RF checks used the same programmed image and the corrected, frozen host checkers:
+
+- Four 60-second runs covered Live and Sweep on both bands; each received 472 RF frames and exited zero.
+- A 600-second 2.4 GHz Sweep run received 4738 RF frames and 364 cycle markers and exited zero, with no post-acknowledgement parser errors or missing-RF coverage failures.
+- That long run reported 425 dropped AP sightings (`ap_dropped`), not dropped RF frames. The bounded AP observation path is not lossless.
+- The physical-device `MainWindow`/`SerialReader` harness passed all 11 steps and exited zero: real rendering, display controls, FFT/rate changes, Sweep/count, both bands, pause/resume, reconnect and Demo restore.
+- Waterfall warm-up verified 31 received-data-driven rows on each band, including row shifting; the actual screenshots were inspected for dBFS units, measured traces, history and unavailable utilization.
+- The host suite passed 189 tests; scoped Pyright and Ruff checks passed. Synthetic PTY runs are retained separately from physical-device evidence.
+
+The UART runs used 921600 baud through CP2102N. These results establish operation on the tested board, not calibrated accuracy or lossless transmission under arbitrary host stalls.
+Earlier mode/period tests that stopped reading for one second between cases recorded truncated frames; those failures are retained, not reclassified as successful tests.
+Two runs of the same matrix with reception continuing through that interval passed without the discarded-byte failure.
+This supports a receive-pause dependence; it does not identify the exact driver, bridge or host-buffer loss point.
+Keep reading while acquisition runs; GUI Pause stops applying observations but does not stop its serial reader.
+Utilization was unavailable in this baseline. The later [CCA experiments](esp32c5-spectrum-research.md#subsequent-cca-counter-experiments) support an experimental sampled PHY counter ratio; its shorter measurement window must not be presented as whole-dwell utilization.
+
+The RF-specific checkers are `scripts/rf_spectrum_smoke.py` and `scripts/rf_gui_harness.py`.
+Their `--self-test` modes use fixtures or a synthetic PTY device, never real RF.
+For physical runs, use `--port` with the identified board; close other serial consumers first.
+The GUI harness exercises `MainWindow` and `SerialReader`; an offscreen run is not Windows or interactive desktop validation.
+On headless Linux, set `QT_QPA_PLATFORM=offscreen` when invoking the GUI harness, including `--help` and `--self-test`.
+
+```sh
+uv run python scripts/rf_spectrum_smoke.py --port /dev/ttyUSB0 --band 0 --mode sweep --seconds 600
+QT_QPA_PLATFORM=offscreen uv run python scripts/rf_gui_harness.py --port /dev/ttyUSB0 --shots build/rf-gui-shots
+```
+
+Run the tools sequentially, not with simultaneous access to the port.
+Change `--band` to `1` for 5 GHz and `--mode` to `live` for per-snapshot updates.
+The initial RF baseline's ten-minute run was on 2.4 GHz; its 5 GHz runs were shorter protocol tests and GUI acceptance. The later RF and sampled-CCA acceptance above includes separate ten-minute runs on both bands.
+
+### Earlier packet-only monitor evidence
+
+The commands and results below describe the previously verified packet-monitor path.
+They are retained for protocol regression coverage and do not substitute for RF spectrum acceptance.
+`make smoke` and `scripts/monitor_smoke.py --port` expect the earlier packet-only capability flags and will reject the RF-enabled image.
+Do not use those commands to validate the current RF firmware; use `scripts/rf_spectrum_smoke.py --port` instead.
 
 Close other serial consumers before running the smoke tool.
 Use the actual serial port of the identified board:
@@ -164,7 +261,7 @@ The self-test never opens real hardware.
 Hardware qualification includes observable AP traffic on both bands, a ten-minute stream without resets, and receiver-pause recovery. Verify firmware queue saturation separately: with UART flow control disabled, stopping PC reads does not backpressure the MCU.
 Empty RF observations are not evidence of working reception on an otherwise unverified band.
 Inspect the real GUI with the board as well as running the CLI checks.
-Verified on the connected ESP32-C5 through CP2102N USB-UART:
+Verified on the earlier packet-only firmware through CP2102N USB-UART:
 
 - EIM and Podman builds using ESP-IDF v6.0.3; UART programming with image-hash verification.
 - All 12 default smoke checks, including both bands/modes, invalid mode/band/length, CRC corruption, split and concatenated CONFIG. The entire post-sync session, including inter-case drains, had zero TLV/JSON parse errors.
@@ -173,7 +270,7 @@ Verified on the connected ESP32-C5 through CP2102N USB-UART:
 - An offscreen GUI harness using the actual `MainWindow` and `SerialReader` against the physical board: non-default initial configuration, Live/Sweep and band switching, measured packet/AP views, disconnect/reconnect and normal close passed. This exercises the real GUI data path, not interactive desktop or Windows visual QA.
 
 These are ambient observations and protocol tests, not calibrated RF measurements.
-JTAG/GDB application-breakpoint verification remains unperformed with the native port disconnected. Windows wslc, Windows real-port GUI operation, and controlled-RF accuracy testing also remain unverified.
+JTAG/GDB application-breakpoint verification remains unperformed with the native port disconnected; it is separate from the USB-UART runtime checks. Windows wslc and Windows real-port GUI validation are performed by the user. Controlled-RF accuracy comparison was excluded from this acceptance scope; no calibration claim is made.
 
 ## Source map
 
@@ -181,12 +278,15 @@ JTAG/GDB application-breakpoint verification remains unperformed with the native
 |---|---|
 | `firmware/main/monitor_core.c` | Portable CONFIG/CRC, AP parsing, aggregation, cJSON events, epoch/cycle state |
 | `firmware/main/monitor_radio.c` | ESP-IDF Wi-Fi capture and channel control |
+| `firmware/main/monitor_capture.c`, `bank_guard.ld` | Private SDK I/Q snapshot adapter and capture-bank exclusion |
+| `firmware/main/monitor_spectrum.c` | Fixed-workspace complex FFT, dBFS normalization and RF encoding |
 | `firmware/main/monitor_link.c` | UART0 transport through the USB-UART bridge and CONFIG mailbox |
 | `firmware/main/app_main.c` | Initialization, dwell scheduling and event production |
 | `firmware/sdkconfig.defaults` | Checked-in binary-stream and RTOS defaults |
 | `firmware/main/idf_component.yml`, `firmware/dependencies.lock` | Component requirement and resolved versions |
 | `scripts/fw.py`, `Makefile` | EIM/Podman/wslc build routes and local commands |
 | `scripts/monitor_smoke.py` | Real-port protocol checks and continuous capture |
+| `scripts/rf_spectrum_smoke.py`, `scripts/rf_gui_harness.py` | RF protocol checker and shared-GUI integration harness |
 | `tests/native/`, `tests/test_firmware_core.py` | Native firmware-core fixtures and sanitizer runs |
 
 Keep the manifests, lockfiles and defaults tracked.
