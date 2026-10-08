@@ -24,20 +24,24 @@
 #include "nvs_flash.h"
 
 #define HEARTBEAT_PERIOD_US 1000000
-#define DWELL_POLL_STEP_MS 10      /* dwell wait: link poll + CCA slot tick;
-                                    * targets all 8 slots under normal window
-                                    * timing, not guaranteed (missed slots
-                                    * surface via attempted) */
+#define DWELL_POLL_STEP_MS 1       /* dwell wait cadence: deadline poll +
+                                    * CCA slot tick; 1 ms admits 32 attempts
+                                    * in a 160 ms dwell (bounded vTaskDelay,
+                                    * no busy loop; missed slots surface via
+                                    * attempted) */
 #define CHANNEL_ERROR_BACKOFF_POLL_MS 20  /* error-backoff cadence */
 #define CHANNEL_ERROR_BACKOFF_LIMIT_MS 1000
 
-/* CONFIG defaults: live, 2.4 GHz, 1000 ms, FFT 64, 20000 kHz. */
+/* CONFIG defaults: live, 2.4 GHz, 1000 ms, FFT 64, 20000 kHz, AUTO dwell,
+ * 16 CCA attempts (MONITOR_CCA_ATTEMPTS_DEFAULT). */
 static const MonitorConfig DEFAULT_CONFIG = {
     .mode = 0,
     .band = 0,
     .sweep_ms = 1000,
     .fft_size = 64,
     .sample_rate_khz = 20000,
+    .channel_dwell_ms = 0,
+    .cca_attempts = MONITOR_CCA_ATTEMPTS_DEFAULT,
 };
 
 static MonitorRun g_run;
@@ -71,7 +75,7 @@ static void send_config_event(void) {
     MonitorConfigEvent event = {
         .epoch = g_run.epoch,
         .config = g_run.active_config,
-        .dwell_ms = monitor_dwell_ms(g_run.active_config.sweep_ms,
+        .dwell_ms = monitor_dwell_ms(&g_run.active_config,
                                      channel_count),
         .channels = g_channel_list,
         .channel_count = channel_count,
@@ -233,7 +237,7 @@ void app_main(void) {
             continue;
         }
         uint32_t dwell_ms =
-            monitor_dwell_ms(g_run.active_config.sweep_ms, channel_count);
+            monitor_dwell_ms(&g_run.active_config, channel_count);
         (void)monitor_run_begin_cycle(&g_run);
         int64_t cycle_start_us = esp_timer_get_time();
         bool cycle_discarded = false;
@@ -254,8 +258,9 @@ void app_main(void) {
                 send_config_event();
             }
             uint8_t channel = g_channel_list[i];
-            esp_err_t tune_err =
-                monitor_radio_begin(g_run.active_config.band, channel);
+            esp_err_t tune_err = monitor_radio_begin(
+                g_run.active_config.band, channel,
+                g_run.active_config.cca_attempts);
             if (tune_err != ESP_OK) {
                 send_channel_error(channel, esp_err_to_name(tune_err));
                 /* Bound the error rate; keep polling (not consuming) link.
@@ -281,12 +286,15 @@ void app_main(void) {
                 }
                 continue;
             }
-            /* Dwell wait: poll + CCA slot tick every 10 ms; scheduling
-             * uses actual elapsed time inside monitor_radio_cca_tick, and
-             * a changed CONFIG still applies only at the next channel
-             * boundary, never mid-dwell. */
-            for (uint32_t waited = 0; waited < dwell_ms;
-                 waited += DWELL_POLL_STEP_MS) {
+            /* Dwell wait: poll + CCA slot tick every 1 ms until the
+             * DEADLINE on the RECEIVE-START clock (retune excluded, slot-0
+             * CCA window inside the dwell — one basis shared with the CCA
+             * scheduler and observed_ms); bounded FreeRTOS delay, not
+             * repeated fixed waits. A changed CONFIG still applies only at
+             * the next channel boundary, never mid-dwell. */
+            int64_t deadline_us = monitor_radio_receive_start_us() +
+                                  (int64_t)dwell_ms * 1000;
+            while (esp_timer_get_time() < deadline_us) {
                 vTaskDelay(pdMS_TO_TICKS(DWELL_POLL_STEP_MS));
                 poll_link();
                 monitor_radio_cca_tick(dwell_ms);

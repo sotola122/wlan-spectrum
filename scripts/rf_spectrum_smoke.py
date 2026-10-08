@@ -36,10 +36,13 @@ class ConfigRequest:
     sweep_ms: int
     fft_size: int
     sample_rate_khz: int
+    channel_dwell_ms: int = 0    # 0 = AUTO (item 2, one CURRENT CONFIG)
+    cca_attempts: int = 16       # default 16 attempts
 
     def as_tuple(self) -> tuple:
         return (self.mode, self.band, self.sweep_ms, self.fft_size,
-                self.sample_rate_khz)
+                self.sample_rate_khz, self.channel_dwell_ms,
+                self.cca_attempts)
 
 
 @dataclass
@@ -69,7 +72,8 @@ class Report:
 def _config_fields(msg: tlv.Status) -> tuple:
     d = msg.data
     return (d.get("mode"), d.get("band"), d.get("sweep_ms"),
-            d.get("fft_size"), d.get("sample_rate_khz"))
+            d.get("fft_size"), d.get("sample_rate_khz"),
+            d.get("channel_dwell_ms"), d.get("cca_attempts"))
 
 
 def _caps_valid(data: dict) -> str | None:

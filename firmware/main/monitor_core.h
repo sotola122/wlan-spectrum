@@ -26,15 +26,27 @@
  * exact header + payload bytes; legacy CRC-less frames are rejected. */
 #define MONITOR_TLV_HEADER_BYTES 3
 #define MONITOR_TLV_CRC_BYTES 4
-#define MONITOR_CONFIG_PAYLOAD_BYTES 10
-#define MONITOR_CONFIG_FRAME_BYTES 13      /* header + payload (CRC input) */
-#define MONITOR_CONFIG_STREAM_BYTES 17     /* frame + 4-byte checksum */
+/* ONE CURRENT v1 CONFIG payload <BBHHIHB>: mode u8, band u8, sweep_ms u16,
+ * fft_size u16, sample_rate_khz u32, channel_dwell_ms u16 (appended at
+ * payload offset 10), cca_attempts u8 (payload offset 12). Old field
+ * offsets are preserved; there is NO legacy payload fallback. */
+#define MONITOR_CONFIG_PAYLOAD_BYTES 13
+#define MONITOR_CONFIG_FRAME_BYTES 16      /* header + payload (CRC input) */
+#define MONITOR_CONFIG_STREAM_BYTES 20     /* frame + 4-byte checksum */
 #define MONITOR_MAX_ACCESS_POINTS 8
 #define MONITOR_MAX_SSID_BYTES 32
 #define MONITOR_JSON_CAPACITY_BYTES 4096
 #define MONITOR_TLV_FRAME_CAPACITY_BYTES 4103  /* 3 + 4096 body + 4 crc */
 #define MONITOR_MAX_CHANNELS 20            /* 5 GHz JP allowlist size */
 #define MONITOR_MIN_DWELL_MS 120
+/* CCA attempts: 1..32 on the wire; 0 is invalid (never a silent default
+ * on an accepted frame). Effective dwell always budgets 5 ms per attempt
+ * (the per-window wall bound) so the configured count can fit. */
+#define MONITOR_CCA_ATTEMPTS_MIN 1
+#define MONITOR_CCA_ATTEMPTS_MAX 32
+#define MONITOR_CCA_ATTEMPTS_DEFAULT 16
+#define MONITOR_CHANNEL_DWELL_EXPLICIT_MIN_MS 120
+#define MONITOR_CHANNEL_DWELL_EXPLICIT_MAX_MS 2000
 
 /* ------------------------------------------------------------------ config */
 
@@ -42,8 +54,14 @@ typedef struct {
     uint8_t mode;               /* 0 live, 1 sweep */
     uint8_t band;               /* 0 = 2.4 GHz, 1 = 5 GHz */
     uint16_t sweep_ms;          /* requested cycle time, milliseconds */
-    uint16_t fft_size;          /* echoed, not supported by this firmware */
-    uint32_t sample_rate_khz;   /* echoed, not supported by this firmware */
+    uint16_t fft_size;          /* requested FFT; the effective size is
+                                 * echoed in spectrum_effective (64..1024) */
+    uint32_t sample_rate_khz;   /* requested rate; the effective rate_code
+                                 * and span are echoed in
+                                 * spectrum_effective (20/40 MS/s) */
+    uint16_t channel_dwell_ms;  /* 0 = AUTO (ceil(sweep_ms/channels)),
+                                 * else explicit 120..2000 ms */
+    uint8_t cca_attempts;       /* sampled-CCA windows per dwell, 1..32 */
 } MonitorConfig;
 
 typedef struct {
@@ -72,12 +90,17 @@ bool monitor_config_feed(MonitorConfigParser *parser, uint8_t byte,
 /* Field validation for a parsed config (also usable for incoming values). */
 bool monitor_config_is_valid(const MonitorConfig *config);
 
-/* True when all five fields are equal. Never reads padding (plain struct). */
+/* True when all seven fields are equal. Never reads padding (plain struct). */
 bool monitor_config_equal(const MonitorConfig *a, const MonitorConfig *b);
 
-/* Dwell per channel: max(MONITOR_MIN_DWELL_MS, ceil(sweep_ms / channels)).
- * channels == 0 returns 0. Result fits uint32 (sweep_ms <= 65535). */
-uint32_t monitor_dwell_ms(uint16_t sweep_ms, size_t channel_count);
+/* Effective dwell per channel for a parsed config:
+ *   max(MONITOR_MIN_DWELL_MS,
+ *       channel_dwell_ms ? channel_dwell_ms : ceil(sweep_ms / channels),
+ *       5 * cca_attempts)
+ * The 5 ms/attempt term is the per-window wall budget, so the configured
+ * count always fits serially inside the dwell. channels == 0 (or NULL
+ * config) returns 0. */
+uint32_t monitor_dwell_ms(const MonitorConfig *config, size_t channel_count);
 
 /* JP receive-channel allowlist for band (0 or 1). Writes up to capacity
  * channel numbers into out_channels and returns the count for the band
@@ -125,26 +148,27 @@ typedef struct {
     uint8_t access_point_count;
     uint32_t access_points_dropped;    /* unique-BSSID overflow + queue drops */
     /* Sampled PHY CCA (CURRENT pooled contract, no version key): pooled
-     * endpoint of up to EIGHT distributed armed one-shot windows per
-     * VALID dwell, each window strictly validated (reset proof,
-     * done+endpoint, B<=A, bracket >0 and <=5000 us, independent poll
-     * bound). Fields:
+     * endpoint of up to cca_attempts (1..32, default 16) distributed armed
+     * one-shot windows per VALID dwell, each window strictly validated
+     * (reset proof, done+endpoint, B<=A, bracket >0 and <=5000 us,
+     * independent poll bound). Fields:
      *   util_valid       >= 1 valid window this dwell (else gap/nothing)
-     *   util_busy        SUM of valid endpoint B (bounded: 8 x mask)
-     *   util_total       SUM of valid endpoint A (bounded: 8 x mask)
+     *   util_busy        SUM of valid endpoint B (32 x mask fits uint32)
+     *   util_total       SUM of valid endpoint A (32 x mask fits uint32)
      *   util_window_us_upper SUM of the valid wall-time brackets
      *                        (sum of SHORT windows, NOT the dwell span)
-     *   util_samples     number of valid windows, 1..8
-     *   util_attempted   windows actually attempted, samples..8
+     *   util_samples     number of valid windows, 1..32
+     *   util_attempted   windows actually attempted, samples..32
      * Missing/invalid windows contribute NOTHING (never zero-filled);
-     * attempted < 8 is reported honestly (missed slots are skipped, never
-     * burst-caught-up). NAV equivalence not established; not full-dwell. */
+     * attempted < count is reported honestly (missed slots are skipped,
+     * never burst-caught-up). NAV equivalence not established; not
+     * full-dwell. */
     bool util_valid;
     uint32_t util_window_us_upper;      /* sum of valid arm->done brackets */
     uint32_t util_busy;                 /* sum of valid endpoint B */
     uint32_t util_total;                /* sum of valid endpoint A */
-    uint8_t util_samples;               /* valid windows, 1..8 when valid */
-    uint8_t util_attempted;             /* attempted windows, 1..8 */
+    uint8_t util_samples;               /* valid windows, 1..32 when valid */
+    uint8_t util_attempted;             /* attempted windows, 1..32 */
 } MonitorObservation;
 
 /* Reset counters for a new dwell. Task context only (radio capture disabled). */

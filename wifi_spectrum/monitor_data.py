@@ -22,6 +22,7 @@ from .tlv import SpectrumRf
 SCHEMA = "wifi-monitor/1"
 MAX_OBSERVATION_APS = 8
 MAX_TRACKED_APS = 256            # GUI AP table bound
+UTIL_HISTORY_MAX = 16            # bounded per-channel visit history (item 4)
 AP_MAX_AGE_SECONDS = 30.0        # sightings older than this are dropped
 
 # Sampled PHY CCA contract (STATUS channel `util` + capability metadata).
@@ -54,9 +55,9 @@ def parse_channel_util(util) -> dict | None:
         return None
     samples = util.get("samples")
     attempted = util.get("attempted")
-    if type(samples) is not int or not 1 <= samples <= 8:
+    if type(samples) is not int or not 1 <= samples <= 32:
         return None
-    if type(attempted) is not int or not samples <= attempted <= 8:
+    if type(attempted) is not int or not samples <= attempted <= 32:
         return None
     if busy < 0 or busy > total:    # B > A (incl. +1 endpoint) = invalid
         return None
@@ -131,8 +132,10 @@ class MonitorState:
 
     # ------------------------------------------------------------ outgoing
     def request(self, mode: int, band: int, sweep_ms: int, fft_size: int,
-                sample_rate_khz: int) -> None:
-        self._requested = (mode, band, sweep_ms, fft_size, sample_rate_khz)
+                sample_rate_khz: int, channel_dwell_ms: int,
+                cca_attempts: int) -> None:
+        self._requested = (mode, band, sweep_ms, fft_size, sample_rate_khz,
+                           channel_dwell_ms, cca_attempts)
 
     @property
     def requested(self) -> tuple | None:
@@ -170,6 +173,8 @@ class MonitorState:
         self.utilization_available = False
         self.util_samples: dict[int, dict] = {}   # ch -> published util
         self.util_stage: dict[int, dict] = {}     # cycle stage, bounded
+        self.util_history: dict[int, list] = {}   # ch -> bounded visits
+        self._util_cycle: dict[int, int] = {}     # ch -> measured cycle
         self._util_stage_cycle: int | None = None
         self.rf_stage: dict[int, SpectrumRf] = {}
         self.rf_flushed: list[SpectrumRf] = []
@@ -215,20 +220,58 @@ class MonitorState:
 
     def _util_scope(self, cycle: int) -> bool:
         """Bind util staging to ONE cycle id. A newer cycle starts a fresh
-        scope (a lost marker can never mix cycles), an older event touches
-        nothing. The stage is a dict keyed by channel, so it stays bounded
-        by the advertised channel list."""
+        stage scope (a lost marker can never mix cycles), an older event
+        touches nothing. LIVE retention (item 1): the PUBLISHED set is
+        never wholesale-cleared here - each channel's last measurement
+        survives until its replacement, a known invalid/error, closed-
+        cycle missing coverage, or an epoch/band/source reset. The stage
+        is a dict keyed by channel, so it stays bounded by the advertised
+        channel list."""
         if self._util_stage_cycle is None:
             self._util_stage_cycle = cycle
             return True
         if cycle > self._util_stage_cycle:
-            self.util_stage.clear()
-            if self.mode == 0:          # LIVE invalidates at a new cycle;
-                self.util_samples.clear()   # SWEEP keeps its published
-                # snapshot untouched until the matching marker
+            self.util_stage.clear()               # stale older stage
+            if self.mode == 0:
+                # lost marker: the superseded cycle is closed here, so
+                # values measured more than one cycle ago are truly
+                # missing and expire; values from the immediately
+                # previous cycle survive while the new scan visits
+                # channels (item 1 retention), never wholesale-cleared.
+                for c in [c for c in self.util_samples
+                          if self._util_cycle.get(c, cycle)
+                          < cycle - 1]:
+                    self._retire_util(c)
             self._util_stage_cycle = cycle
             return True
         return cycle == self._util_stage_cycle
+
+    def _publish_util(self, ch: int, sample: dict, cycle: int) -> None:
+        """One replacement: the latest raw sample stays distinct from the
+        bounded visit history. The history records each cycle's
+        measurement exactly once (duplicate/heartbeat events at the SAME
+        cycle never double count) with its arrival time for the span
+        readout."""
+        self.util_samples[ch] = sample
+        hist = self.util_history.setdefault(ch, [])
+        if hist and hist[-1][0] == cycle:
+            # same-cycle duplicate/heartbeat: refresh THIS visit's
+            # contribution instead of double counting (count unchanged,
+            # latest raw and aggregate stay coherent)
+            hist[-1] = (cycle, sample["busy"], sample["total"],
+                        self._clock())
+        else:
+            hist.append((cycle, sample["busy"], sample["total"],
+                         self._clock()))
+            del hist[:-UTIL_HISTORY_MAX]          # bounded to GUI max
+        self._util_cycle[ch] = cycle
+
+    def _retire_util(self, ch: int) -> None:
+        """Known invalid / missing coverage: expire the published value
+        AND its history (missing is a gap, never a stale average)."""
+        self.util_samples.pop(ch, None)
+        self.util_history.pop(ch, None)
+        self._util_cycle.pop(ch, None)
 
     def _clear_measurements(self) -> None:
         self.displayed.clear()
@@ -246,13 +289,16 @@ class MonitorState:
         self.unavailable.clear()
         self.util_samples.clear()   # no utilization across an epoch/band
         self.util_stage.clear()
+        self.util_history.clear()
+        self._util_cycle.clear()
         self._util_stage_cycle = None
         self.elapsed_ms = None
 
     def _accept_config(self, data: dict) -> bool:
         fields = tuple(data.get(k) for k in
                        ("mode", "band", "sweep_ms", "fft_size",
-                        "sample_rate_khz"))
+                        "sample_rate_khz", "channel_dwell_ms",
+                        "cca_attempts"))
         if self._requested is None or fields != self._requested:
             return False                 # stale or unrequested device config
         new_epoch = data.get("epoch")
@@ -267,7 +313,7 @@ class MonitorState:
             self._clear_measurements()
         self.ready = True
         self.epoch = new_epoch
-        self.mode, self.band, sweep, fft, rate = fields
+        self.mode, self.band, sweep, fft, rate = fields[:5]
         self.channels = tuple(channel_list)
         self.dwell_ms = data.get("dwell_ms")
         tx_dropped = data.get("tx_dropped", 0)
@@ -295,6 +341,8 @@ class MonitorState:
             # SURVIVES: late older-cycle events still cannot re-seed.
             self.util_samples.clear()
             self.util_stage.clear()
+            self.util_history.clear()
+            self._util_cycle.clear()
         return True
 
     def _parse_spectrum(self, data: dict) -> tuple[dict | None, dict | None]:
@@ -422,6 +470,14 @@ class MonitorState:
         # accepting it would resurrect values the bookkeeping superseded.
         if self._last_cycle is not None and cycle <= self._last_cycle:
             return False
+        # Stale scope rejection BEFORE any side effect: a late older-cycle
+        # observation after a newer cycle was seen must not poison the
+        # newer coverage/staging (coverage is mutated only for cycles at
+        # or above every known high-water mark).
+        marks = [c for c in (self._coverage_cycle, self._staging_cycle,
+                             self._util_stage_cycle) if c is not None]
+        if marks and cycle < max(marks):
+            return False
         observation = decode_channel(data)
         dropped = data.get("ap_dropped", 0)
         if type(dropped) is int and dropped >= 0:
@@ -461,13 +517,13 @@ class MonitorState:
                   and observation.channel in self.channels else None)
         if sample is None:
             self.util_stage.pop(observation.channel, None)
-            if self.mode == 0:      # LIVE gaps immediately; SWEEP keeps
-                self.util_samples.pop(observation.channel, None)  # old
-                # published value until the matching marker replaces it
+            if self.mode == 0:      # LIVE: known invalid expires NOW;
+                self._retire_util(observation.channel)  # SWEEP keeps its
+                # old value until the matching marker retires/replaces it
         else:
             self.util_stage[observation.channel] = sample
             if self.mode == 0:      # live publishes immediately
-                self.util_samples[observation.channel] = sample
+                self._publish_util(observation.channel, sample, cycle)
 
     def _accept_cycle(self, data: dict) -> bool:
         if not self._measurement_epoch_ok(data):
@@ -508,23 +564,27 @@ class MonitorState:
                 self.rf_flushed = list(self.rf_stage.values())
             self.rf_stage.clear()
         self._rf_stage_cycle = None
-        # util flush: the published snapshot is replaced ONLY by its OWN
-        # matching marker (exact staged subset). A NEWER marker that saw no
-        # channel util publishes an EMPTY set - never an older stage; an
-        # OLDER marker never replaces newer state. The cycle id is the
-        # scope HIGH-WATER mark (never reset to None): lost-marker jumps
-        # stay detectable by _util_scope.
-        if self._util_stage_cycle is None:
-            self.util_samples = {}      # nothing ever staged: publish none
+        # util retention (item 1): this marker closes cycle `cycle`'s
+        # coverage. Staged values of THIS cycle replace their channel;
+        # any published value not measured during the closed cycle is
+        # truly missing and expires (missing never survives closure).
+        # An OLDER marker never replaces newer staged/published state.
+        # The cycle id stays the scope HIGH-WATER mark (never reset to
+        # None): lost-marker jumps stay detectable by _util_scope.
+        if (self._util_stage_cycle is not None
+                and cycle < self._util_stage_cycle):
+            pass                        # older marker: state stays intact
+        else:
+            if self._util_stage_cycle == cycle:
+                for ch, staged_sample in self.util_stage.items():
+                    self._publish_util(ch, staged_sample, cycle)
             self.util_stage.clear()
-        elif cycle == self._util_stage_cycle:
-            self.util_samples = dict(self.util_stage)   # exact subset
-            self.util_stage.clear()
-        elif cycle > self._util_stage_cycle:
-            self.util_stage.clear()     # stale older stage discarded
-            self.util_samples = {}      # newer cycle had no util -> empty
-            self._util_stage_cycle = cycle
-        # else: an OLDER marker - newer staged/published state stays intact
+            if (self._util_stage_cycle is not None
+                    and cycle > self._util_stage_cycle):
+                self._util_stage_cycle = cycle
+            for ch in [c for c in self.util_samples
+                       if self._util_cycle.get(c) != cycle]:
+                self._retire_util(ch)   # closed-cycle missing coverage
         self.elapsed_ms = data.get("elapsed_ms")
         self.uptime_ms = data.get("uptime_ms")
         return True
@@ -544,7 +604,7 @@ class MonitorState:
             # a failed dwell invalidates that channel's util NOW - staged
             # or published - so a failed channel cannot retain old percent
             self.util_stage.pop(ch, None)
-            self.util_samples.pop(ch, None)
+            self._retire_util(ch)
         self.last_error = f"ch {ch}: {code}"
         already = ch in self.unavailable
         self.unavailable.add(ch)

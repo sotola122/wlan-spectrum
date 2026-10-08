@@ -32,7 +32,8 @@ from wifi_spectrum.serial_link import SerialReader
 APP = QApplication.instance() or QApplication([])
 
 CFG_DEFAULTS = {"mode": 0, "band": 0, "sweep_ms": 1000, "fft_size": 64,
-                "sample_rate_khz": 20000}
+                "sample_rate_khz": 20000, "channel_dwell_ms": 0,
+                "cca_attempts": 16}
 SCHEMA = "wifi-monitor/1"
 
 RF_CAPS = {"source": "c5_snapshot_iq_fft", "fft_sizes": [64, 128, 256],
@@ -444,7 +445,10 @@ class RfRenderingTests(unittest.TestCase):
         self.fx.deliver(rf_blob(power=[-30.0] * 8))
         self.assertAlmostEqual(self.val_at(2437.0), -30.0, places=3)
         self.win.band_seg.setCurrentIndex(1)           # 5 GHz
-        self.assertEqual(config_from_frame(self.fx.writes[-1])["band"], 1)
+        # acquisition edits are debounced: wait for the ONE coalesced CONFIG
+        self.assertTrue(spin_until(
+            lambda: config_from_frame(self.fx.writes[-1])["band"] == 1),
+            "debounced band CONFIG not sent")
         self.assertFalse(self.win.monitor_state.ready)
         self.assertFalse(self.win._rf_active)
         self.assertTrue(np.isnan(self.win.cur).all())  # old-band data gone
@@ -673,6 +677,7 @@ class RfRenderingTests(unittest.TestCase):
                 "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         self.win.mode_tabs.setCurrentIndex(1)
         self.ack(utilization=cap)
+        self.win.agg_spin.setValue(1)     # RAW: exact per-visit cells
         # valid cycle0: two channels + marker0 -> published exact
         self.deliver(channel_event(ch=6, cycle=0, util=base))
         self.deliver(channel_event(ch=1, cycle=0,
@@ -919,10 +924,13 @@ class RfRenderingTests(unittest.TestCase):
         writes = len(self.fx.writes)
         self.win.fft_combo.setCurrentText("256")
         self.win.sr_combo.setCurrentText("40 MS/s")
+        # edits coalesce into ONE debounced CONFIG (no mid-edit resets)
+        self.assertTrue(spin_until(lambda: len(self.fx.writes) > writes),
+                        "debounced CONFIG not sent")
         sent = [config_from_frame(w) for w in self.fx.writes[writes:]]
-        self.assertEqual([s["fft_size"] for s in sent], [256, 256])
-        self.assertEqual([s["sample_rate_khz"] for s in sent],
-                         [20000, 40000])
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["fft_size"], 256)
+        self.assertEqual(sent[0]["sample_rate_khz"], 40000)
         self.assertEqual(self.win.rbw_lbl.text(), "156.2 kHz")  # unchanged:
         # RBW follows the device's EFFECTIVE values, not the new request
 
@@ -1073,9 +1081,11 @@ class ConfigAckRetryTests(unittest.TestCase):
     def test_change_while_unacked_resends_latest_tuple(self) -> None:
         self.fx.opened.emit()
         self.win.fft_combo.setCurrentText("256")   # new intent, still unacked
-        self.assertTrue(spin_until(lambda: len(self.fx.writes) >= 3))
-        self.assertEqual(config_from_frame(self.fx.writes[-1])["fft_size"],
-                         256, "retry must resend the LATEST tuple")
+        # acquisition edits debounce (400ms) into ONE CONFIG; from then on
+        # every bounded retry must carry the LATEST tuple
+        self.assertTrue(spin_until(
+            lambda: config_from_frame(self.fx.writes[-1])["fft_size"]
+            == 256), "debounced 256 CONFIG never sent")
         self._ack_latest()
         self.assertTrue(spin_until(lambda: self.win.monitor_state.ready))
         self.assertFalse(self.win._cfg_timer.isActive())
@@ -1108,6 +1118,258 @@ class ConfigAckRetryTests(unittest.TestCase):
         APP.processEvents()
         self.assertEqual(len(self.fx.writes), 1,
                          "stale retry after legacy fallback")
+
+
+class FakeSettings:
+    """Deterministic injectable store: plain dict, no QSettings, no user
+    file (settings-performance-scope item 5)."""
+
+    def __init__(self, data: dict | None = None) -> None:
+        self.data = dict(data or {})
+
+    def value(self, key, default=None):
+        return self.data.get(key, default)
+
+    def setValue(self, key, value) -> None:   # noqa: N802 (Qt API)
+        self.data[key] = value
+
+
+class SettingsAggregationRetentionTests(unittest.TestCase):
+    """items 1/4/5/6: Live retention in the GUI, aggregate sum over visits
+    with raw metadata in the tooltip, injectable settings + Apply, and
+    TextItem reuse / no unchanged writes."""
+
+    def setUp(self) -> None:
+        self.win = MainWindow()
+        self.win.show()
+        APP.processEvents()
+        self.fx = FixtureReader()
+        self.win._attach(self.fx)
+        self.win.play_btn.setChecked(True)
+        self.fx.opened.emit()
+
+    def tearDown(self) -> None:
+        self.win.close()
+        APP.processEvents()
+
+    def util(self, busy: int = 100) -> dict:
+        return {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+                "busy": busy, "total": 1000, "samples": 4,
+                "attempted": 4, "window_us_upper": 819}
+
+    def util_ack(self) -> None:
+        fields = config_from_frame(self.fx.writes[-1])
+        self.fx.deliver(tlv.encode_status_json(rf_config_event(
+            **fields, utilization={"available": True,
+                                   "source": UTIL_SOURCE,
+                                   "confidence": UTIL_CONFIDENCE})))
+
+    def test_live_retention_cells_survive_new_cycle(self) -> None:
+        self.util_ack()
+        for cycle in (1,):
+            for ch in range(1, 14):
+                self.win._on_monitor_status(channel_event(
+                    cycle=cycle, ch=ch, util=self.util()))
+        for r in range(13):
+            self.assertNotEqual(cell_text(self.win.ch_table, r, 2), "—")
+        # parent repro: first channel of cycle 2 must not gap the rest
+        self.win._on_monitor_status(channel_event(
+            cycle=2, ch=1, util=self.util(0)))
+        for r in range(13):
+            self.assertNotEqual(cell_text(self.win.ch_table, r, 2), "—",
+                                f"row {r} lost its retained value")
+
+    def test_aggregate_sum_over_visits_with_raw_metadata(self) -> None:
+        self.util_ack()
+        self.win.agg_spin.setValue(2)
+        self.win._on_monitor_status(channel_event(
+            cycle=1, ch=6, util=self.util(500)))
+        self.win._on_monitor_status(channel_event(
+            cycle=2, ch=6, util=self.util(0)))
+        row = row_of(self.win, 6)
+        self.assertEqual(cell_text(self.win.ch_table, row, 2), "25 %")
+        cell = self.win.ch_table.item(row, 2)
+        self.assertIsNotNone(cell)
+        tip = cell.toolTip() if cell is not None else ""
+        self.assertIn("busy 0", tip)              # latest raw first
+        self.assertIn("sum busy 500 / sum total 2000", tip)  # aggregates
+        self.assertIn("2 visits", tip)
+        # raw option: exactly the latest measurement, no averaging
+        self.win.agg_spin.setValue(1)
+        self.win._sync_util_from_state()
+        self.assertEqual(cell_text(self.win.ch_table, row, 2), "0 %")
+
+    def test_settings_clamp_reset_apply_and_persistence(self) -> None:
+        store = FakeSettings({"fps": 999, "history_rows": 10,
+                              "aggregation": 99, "channel_dwell_ms": 50,
+                              "cca_attempts": 99,
+                              # existing acquisition knobs persist too
+                              "mode": 1, "band": 1, "sweep_ms": 3000,
+                              "fft_size": 1024, "sample_rate_khz": 40000})
+        win = MainWindow(settings=store)
+        win.show()
+        APP.processEvents()
+        try:
+            self.assertEqual(win.fps_spin.value(), 60)
+            self.assertEqual(win.hist_spin.value(), 50)
+            self.assertEqual(win.agg_spin.value(), 16)
+            self.assertEqual(win.dwell_spin.value(), 120)  # clamped >=120
+            self.assertEqual(win.attempts_spin.value(), 32)
+            self.assertEqual(win._render_timer.interval(), 1000 // 60)
+            # saved acquisition knobs restore (validated/clamped)
+            self.assertEqual(win.mode_tabs.currentIndex(), 1)
+            self.assertEqual(win.band_seg.currentIndex(), 1)
+            self.assertEqual(win.sweep_time.value(), 3000)
+            self.assertEqual(win.fft_combo.currentText(), "1024")
+            self.assertEqual(win.sr_combo.currentText(), "40 MS/s")
+            # no sensitive keys are ever written
+            self.assertFalse(any(k in store.data
+                                 for k in ("port", "usb", "auto_connect")))
+            # reset defaults covers every saved knob, deterministically
+            win.reset_settings_btn.click()
+            self.assertEqual(win.mode_tabs.currentIndex(), 0)
+            self.assertEqual(win.band_seg.currentIndex(), 0)
+            self.assertEqual(win.sweep_time.value(), 1000)
+            self.assertEqual(win.fft_combo.currentText(), "64")
+            self.assertEqual(win.sr_combo.currentText(), "20 MS/s")
+            self.assertEqual(win.fps_spin.value(), 30)
+            self.assertEqual(win.hist_spin.value(), 200)
+            self.assertEqual(win.agg_spin.value(), 4)
+            self.assertEqual(win.dwell_spin.value(), 0)
+            self.assertEqual(win.attempts_spin.value(), 16)
+            self.assertEqual(store.data.get("mode"), 0)
+            self.assertEqual(store.data.get("band"), 0)
+            self.assertEqual(store.data.get("sweep_ms"), 1000)
+            self.assertEqual(store.data.get("fft_size"), 64)
+            self.assertEqual(store.data.get("sample_rate_khz"), 20000)
+        finally:
+            win.close()
+            APP.processEvents()
+
+    def test_apply_sends_one_seven_field_config_display_changes_do_not(self) -> None:
+        self.util_ack()
+        writes = len(self.fx.writes)
+        self.win.fps_spin.setValue(25)          # display-only: no CONFIG
+        self.assertEqual(len(self.fx.writes), writes)
+        self.win.attempts_spin.setValue(7)
+        self.win.dwell_spin.setValue(300)
+        self.win.apply_btn.click()
+        self.assertEqual(len(self.fx.writes), writes + 1)
+        sent = config_from_frame(self.fx.writes[-1])
+        self.assertEqual(sent["cca_attempts"], 7)
+        self.assertEqual(sent["channel_dwell_ms"], 300)
+        # ack echo of the nondefaults is accepted
+        self.fx.deliver(tlv.encode_status_json(rf_config_event(**sent)))
+        self.assertTrue(self.win.monitor_state.ready)
+
+    def test_textitems_reused_and_no_unchanged_cell_writes(self) -> None:
+        self.util_ack()
+        for ch in range(1, 14):
+            self.win._on_monitor_status(channel_event(ch=ch,
+                                                      util=self.util()))
+        ids1 = [id(t) for t in self.win.util_texts]
+        writes1 = self.win._cell_writes
+        self.win._on_monitor_status(channel_event(ch=6,
+                                                  util=self.util(100)))
+        ids2 = [id(t) for t in self.win.util_texts]
+        self.assertEqual(ids1, ids2, "TextItems must be reused, not rebuilt")
+        self.assertEqual(self.win._cell_writes, writes1,
+                         "identical cell text must not be rewritten")
+
+    def test_history_rows_resize_the_waterfall(self) -> None:
+        store = FakeSettings({"history_rows": 500})
+        win = MainWindow(settings=store)
+        win.show()
+        APP.processEvents()
+        try:
+            win._init_display_arrays()
+            self.assertEqual(int(win.wf.shape[0]), 500)
+        finally:
+            win.close()
+            APP.processEvents()
+
+    def test_old_heartbeat_cannot_clobber_pending_edits(self) -> None:
+        """GUI ingress: an OLD-config heartbeat arriving INSIDE the
+        debounce window must not force the device-effective selection
+        back over the user's pending edit; the NEW tuple still goes out."""
+        self.util_ack()
+        writes = len(self.fx.writes)
+        self.win.fft_combo.setCurrentText("64")
+        self.win.sr_combo.setCurrentText("40 MS/s")
+        old = config_from_frame(self.fx.writes[-1])   # OLD 5/7-field echo
+        self.fx.deliver(tlv.encode_status_json(rf_config_event(**old)))
+        APP.processEvents()
+        self.assertEqual(self.win.fft_combo.currentText(), "64",
+                         "pending FFT edit clobbered by old effective ack")
+        self.assertEqual(self.win.sr_combo.currentText(), "40 MS/s",
+                         "pending rate edit clobbered by old effective ack")
+        self.assertTrue(spin_until(lambda: len(self.fx.writes) > writes),
+                        "debounced CONFIG after protected edit never sent")
+        sent = config_from_frame(self.fx.writes[-1])
+        self.assertEqual(sent["fft_size"], 64)
+        self.assertEqual(sent["sample_rate_khz"], 40000)
+        # the device acks the NEW tuple and the state accepts it
+        self.fx.deliver(tlv.encode_status_json(rf_config_event(**sent)))
+        self.assertTrue(spin_until(lambda: self.win.monitor_state.ready))
+
+    def test_history_resize_preserves_populated_rf_state(self) -> None:
+        """Resizing history must not clear measurements/coverage or send a
+        CONFIG: only the waterfall grows/shrinks, keeping the newest rows."""
+        self.util_ack()
+        for ch in range(1, 14):
+            self.win._on_monitor_status(channel_event(
+                cycle=1, ch=ch, util=self.util()))
+        self.fx.deliver(rf_blob(power=[-30.0] * 8))
+        self.assertTrue(self.win._rf_active)
+        cur_before = self.win.cur.copy()
+        peak_before = self.win.peak.copy()
+        wf_before = self.win.wf.copy()
+        cell_before = cell_text(self.win.ch_table, row_of(self.win, 6), 2)
+        writes = len(self.fx.writes)
+        self.win.hist_spin.setValue(500)
+        self.assertEqual(int(self.win.wf.shape[0]), 500)
+        # _push_row prepends the NEWEST row at wf[0]: growth must keep the
+        # newest min(old, new) rows at the TOP, new rows below them
+        np.testing.assert_array_equal(self.win.wf[:200], wf_before)
+        # every other measurement/coverage untouched
+        np.testing.assert_array_equal(self.win.cur, cur_before)
+        np.testing.assert_array_equal(self.win.peak, peak_before)
+        self.assertEqual(len(self.win.monitor_state.util_samples), 13)
+        self.assertTrue(self.win._rf_active)
+        self.assertEqual(cell_text(self.win.ch_table, row_of(self.win, 6),
+                                   2), cell_before)
+        # display-only: NO config frame was written
+        self.assertEqual(len(self.fx.writes), writes)
+
+    def test_history_shrink_keeps_newest_and_push_order_stays(self) -> None:
+        """Shrinking drops the OLDEST rows only: the newest rows stay at
+        wf[0..], and a subsequent _push_row keeps the newest-first order
+        (roll + write at index 0). cur/peak/util/coverage untouched, no
+        CONFIG."""
+        self.util_ack()
+        for ch in range(1, 14):
+            self.win._on_monitor_status(channel_event(
+                cycle=1, ch=ch, util=self.util()))
+        # distinct rows: after N pushes wf[i] holds value (N-1-i)
+        for i in range(20):
+            self.win.cur[:] = float(i)
+            self.win._push_row()
+        old = self.win.wf.copy()
+        writes = len(self.fx.writes)
+        self.win.hist_spin.setValue(50)          # 200 -> 50 (shrink)
+        self.assertEqual(int(self.win.wf.shape[0]), 50)
+        # newest50 rows preserved at the top, oldest rows dropped
+        np.testing.assert_array_equal(self.win.wf, old[:50])
+        # subsequent push: newest at wf[0]; the roll shifts the previous
+        # window down and drops its OLDEST row (fixed row count)
+        self.win.cur[:] = 7.5
+        self.win._push_row()
+        self.assertEqual(float(self.win.wf[0, 0]), 7.5)
+        np.testing.assert_array_equal(self.win.wf[1:], old[:49])
+        # measurements/coverage intact, display-only (no CONFIG)
+        self.assertEqual(len(self.win.monitor_state.util_samples), 13)
+        self.assertTrue(self.win._rf_active)
+        self.assertEqual(len(self.fx.writes), writes)
 
 
 if __name__ == "__main__":

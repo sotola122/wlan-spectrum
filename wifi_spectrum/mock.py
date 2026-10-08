@@ -53,6 +53,7 @@ class MockDevice:
     def __init__(self) -> None:
         self.mode, self.band = MODE_LIVE, BAND_24
         self.sweep_ms, self.fft_size, self.sample_rate_khz = 1000, 64, 20000
+        self.channel_dwell_ms, self.cca_attempts = 0, 16
         self.sweep_count = 0
         self._seg_idx, self._seg_acc = 0, 0.0
         self._util_acc, self._status_acc = 0.0, 0.0
@@ -61,11 +62,15 @@ class MockDevice:
         self._microwave = 0.0
 
     # -- control ------------------------------------------------------
-    def configure(self, mode=None, band=None, sweep_ms=None, fft_size=None, sample_rate_khz=None):
+    def configure(self, mode=None, band=None, sweep_ms=None, fft_size=None,
+                  sample_rate_khz=None, channel_dwell_ms=None,
+                  cca_attempts=None):
         if band is not None and band != self.band:
             self._seg_idx = 0
         for k, v in {"mode": mode, "band": band, "sweep_ms": sweep_ms,
-                     "fft_size": fft_size, "sample_rate_khz": sample_rate_khz}.items():
+                     "fft_size": fft_size, "sample_rate_khz": sample_rate_khz,
+                     "channel_dwell_ms": channel_dwell_ms,
+                     "cca_attempts": cca_attempts}.items():
             if v is not None:
                 setattr(self, k, v)
 

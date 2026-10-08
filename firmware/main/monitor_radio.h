@@ -35,8 +35,13 @@ esp_err_t monitor_radio_init(void);
 /* Tune band/channel, enable passive reception, and start observation
  * timing. Timing starts only after tuning and reception are enabled.
  * On failure nothing is observed and the returned SDK error should be
- * reported as channel_error. Band 0 = 2.4 GHz, band 1 = 5 GHz. */
-esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel);
+ * reported as channel_error. Band 0 = 2.4 GHz, band 1 = 5 GHz.
+ * cca_attempts (validated 1..32 by config; clamped here defensively:
+ * 0 -> default 16, >32 -> 32) selects how many sampled-CCA windows this
+ * dwell schedules; the effective dwell must budget 5 ms per attempt
+ * (monitor_dwell_ms does). */
+esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel,
+                              uint8_t cca_attempts);
 
 /* Stop timing and reception, then copy out the complete observation
  * (counters, bounded AP sightings, rounded observed_ms). Only call after a
@@ -44,18 +49,29 @@ esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel);
  * excluded from observed_ms. */
 void monitor_radio_finish(MonitorObservation *out);
 
+/* Receive-start timestamp of the current dwell: set after tuning and
+ * reception are enabled, BEFORE the slot-0 CCA window (so the window cost
+ * sits inside the dwell, retune cost outside). Valid only after a
+ * successful monitor_radio_begin; the application uses it as THE deadline
+ * basis so the dwell loop, the CCA scheduler, and observed_ms share one
+ * receive-start clock. Task-only. */
+int64_t monitor_radio_receive_start_us(void);
+
 /* Sampled PHY CCA (CURRENT pooled contract, no version key): up to
- * EIGHT distributed one-shot windows per dwell. monitor_radio_begin
- * attempts slot 0 (dwell start); the application calls this once per
- * dwell-wait tick (10 ms).
+ * cca_attempts (1..32, default 16) distributed one-shot windows per
+ * dwell. monitor_radio_begin attempts slot 0 (dwell start); the
+ * application calls this once per dwell-wait tick (1 ms cadence: 32
+ * attempts fit a 160 ms dwell).
  * Scheduling uses ACTUAL elapsed time since begin:
- * slot = floor(elapsed_us * 8 / dwell_us); a slot below the next pending
- * index returns immediately (missed slots are skipped, never burst), and
- * at most ONE window is attempted per call. Ticks too close to dwell end
- * (< one window budget remaining) skip entirely so a window never
- * straddles the dwell. Each window keeps the strict per-window bounds
- * (reset proof, done+endpoint, <=5000 us, <=4M polls — frozen-clock
- * safe). No-op when no dwell is active. */
+ * slots are distributed over [0, dwell - 5000us) —
+ * slot = floor(elapsed_us * attempts / (dwell_us - 5000us)) — so every
+ * due slot still has the full window budget left (end-of-dwell tail).
+ * A slot below the next pending index returns immediately (missed slots
+ * are skipped, never burst), and at most ONE window is attempted per
+ * call. Ticks in the tail (< one window budget remaining) skip entirely
+ * so a window never straddles the dwell. Each window keeps the strict
+ * per-window bounds (reset proof, done+endpoint, <=5000 us, <=4M polls —
+ * frozen-clock safe). No-op when no dwell is active. */
 void monitor_radio_cca_tick(uint32_t dwell_ms);
 
 #endif /* MONITOR_RADIO_H */

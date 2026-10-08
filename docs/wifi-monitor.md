@@ -25,16 +25,21 @@ The wider channel list used by Demo is not the real-device channel policy.
 ## CONFIG and acquisition timing
 
 The [TLV contract](tlv-protocol.md) defines the CRC32-protected binary CONFIG payload.
-Accepted values are mode `0` (Live) or `1` (Sweep), band `0` (2.4 GHz) or `1` (5 GHz), sweep time 100–10000 ms, FFT size 64/128/256/512/1024, and sample rate 20000/40000 kHz.
+Accepted values are mode `0` (Live) or `1` (Sweep), band `0` (2.4 GHz) or `1` (5 GHz), sweep time 100–10000 ms, FFT size 64/128/256/512/1024, sample rate 20000/40000 kHz, requested channel dwell `0` (Auto) or 120–2000 ms, and 1–32 CCA attempts per dwell.
 FFT size and sample rate control the snapshot FFT; STATUS reports both supported capabilities and the active effective settings.
 Rate code 2 means 20 MS/s and code 1 means 40 MS/s; codes are identifiers, not indices into the capability array.
-Defaults are Live, 2.4 GHz, 1000 ms, 64, and 20000 kHz.
+Defaults are Live, 2.4 GHz, 1000 ms, 64, 20000 kHz, automatic dwell and 16 CCA attempts.
 
 Both modes hop through the selected band's channels.
 Live displays each completed channel observation; Sweep stages observations until a cycle event.
-The per-channel dwell is `max(120, ceil(sweep_ms / number_of_channels))` ms.
+The per-channel dwell is `max(120, requested_dwell, 5 * cca_attempts)` ms, where `requested_dwell` is the nonzero `channel_dwell_ms` override or otherwise `ceil(sweep_ms / number_of_channels)`.
+The attempt budget can therefore raise an explicit dwell request: 32 attempts require a target of at least 160 ms.
 The requested sweep time therefore need not equal the actual cycle time, which also includes tuning, snapshot capture, FFT and scheduling overhead.
 `observed_ms` measures reception time for a channel, while `elapsed_ms` measures the full cycle.
+The dwell deadline is measured from receive start after tuning, before the first
+CCA attempt. Initial sampling time is included; tuning time is not subtracted
+from the receive interval. The loop checks the monotonic clock between bounded
+polling operations and one-millisecond waits, so the target is not an exact cutoff.
 
 The serial reader sends the initial CONFIG after the port opens. The GUI retries an unanswered request at bounded intervals; a matching acknowledgement, disconnect or switch to Demo cancels retrying.
 The firmware keeps the latest valid pending CONFIG and applies it at a channel boundary.
@@ -42,7 +47,7 @@ A changed CONFIG increments `epoch` and discards the incomplete cycle without em
 Its new-epoch `config` event is submitted before new-epoch measurements.
 An identical CONFIG is acknowledged without changing the epoch or restarting the current cycle.
 The `config` event is also sent at startup and approximately once per second as a heartbeat.
-The GUI waits for an echo matching all five requested fields and rejects measurements from a different epoch or band.
+The GUI waits for an echo matching all seven requested fields and rejects measurements from a different epoch or band. `dwell_ms` is the effective target, not a replacement for the requested `channel_dwell_ms` in that comparison.
 
 Pause and the sweep-count limit are PC-side operations, not CONFIG fields.
 The board continues receiving and sending while the GUI is paused.
@@ -61,7 +66,7 @@ JSON object key order has no protocol meaning.
 | `event` | `"config"` |
 | `fw`, `idf`, `chip`, `country` | `"wifi-monitor-0.1"`, `"v6.0.3"`, `"ESP32-C5"`, `"JP"` |
 | `epoch` | Configuration generation, starting at 1 |
-| `mode`, `band`, `sweep_ms`, `fft_size`, `sample_rate_khz` | Active CONFIG echo |
+| `mode`, `band`, `sweep_ms`, `fft_size`, `sample_rate_khz`, `channel_dwell_ms`, `cca_attempts` | Active CONFIG echo |
 | `dwell_ms` | Effective dwell target, at least 120 ms |
 | `channels` | Selected band's receive allowlist |
 | `spectrum`, `fft_supported` | `true` after spectrum-engine initialization; a failed capture still produces no RF frame |
@@ -101,20 +106,25 @@ The optional `channel.util` object uses the channel event's `epoch`, `cycle`, `b
 |---|---|
 | `source` | `"c5_v6.0.3_phy_cca_cnt"` |
 | `confidence` | `"experimental_sampled"` |
-| `samples` | Number of valid windows included in the sums, integer `1..8` |
-| `attempted` | Number of windows actually attempted, integer `samples..8` |
+| `samples` | Number of valid windows included in the sums, integer `1..32` |
+| `attempted` | Number of windows actually attempted, integer `samples..32` |
 | `busy` | Sum of final B counters from valid windows; integer, `0 <= busy <= total` |
 | `total` | Sum of final A counters from valid windows; integer, `samples..samples*0x07ffffff` |
 | `window_us_upper` | Sum of valid windows' elapsed-time upper bounds; integer microseconds, `samples..samples*5000` |
 
-The host computes `100 * busy / total` for the shared utilization bars and channel table. Demo's generated `0x02 CH_UTIL` values remain a separate input path.
+The latest raw percentage is `100 * busy / total`. The host can pool counter sums across recent channel visits for the shared utilization bars and channel table; it does not average rounded percentages. Demo's generated `0x02 CH_UTIL` values remain a separate input path.
 JSON booleans are not valid counts or durations. Unknown additive keys do not change the meaning of these required fields. This measurement uses the existing `wifi-monitor/1` event contract, with no separate utilization-version field or negotiation.
 
-The firmware targets eight attempts distributed across the dwell, rather than eight consecutive measurements at its start. Missed slots are not replayed in a burst. Each attempt reads the current counter limit, arms through the pinned SDK function, observes the reset/in-progress state, then requires the completion flag and the expected final total. Polling has both elapsed-time and iteration bounds. A valid window has a positive elapsed-time bracket of at most 5000 microseconds and `0 <= B <= A`; the observed one-count overflow is rejected, not clipped to 100%.
+The firmware targets the configured number of attempts distributed across the dwell, rather than consecutive measurements at its start. Missed slots are not replayed in a burst. Each attempt reads the current counter limit, arms through the pinned SDK function, observes the reset/in-progress state, then requires the completion flag and the expected final total. Polling has both elapsed-time and iteration bounds. A valid window has a positive elapsed-time bracket of at most 5000 microseconds and `0 <= B <= A`; the observed one-count overflow is rejected, not clipped to 100%.
 
 Only valid windows contribute to either counter sum or the time-bound sum. Failed windows are not counted as idle, and no valid window means no `util` object. The reported counts expose partial measurements. An absent or rejected result clears the current channel value rather than reusing an earlier percentage. Pooling reduces dependence on one short observation; it does not prevent genuine changes in bursty traffic or guarantee a stable percentage.
 
-The UI identifies this source as sampled PHY CCA (experimental). Tooltips expose valid/attempted counts, raw counter sums and the sum of window-time upper bounds. This time bound is not the interval from the first sample to the last, nor the whole dwell duration. No host-side temporal smoothing is applied. Live applies channel results as they arrive; Sweep publishes staged results at cycle completion. Epoch changes, missing observations and incomplete cycles must not retain old values as current measurements.
+The UI identifies this source as sampled PHY CCA (experimental). Tooltips expose the latest raw measurement separately from the displayed aggregate, including valid/attempted counts, raw counter sums and the sum of window-time upper bounds. This time bound is not the interval from the first sample to the last, nor the whole dwell duration.
+
+The aggregation setting uses the latest 1–16 valid visits per channel, with a default of four; one selects the latest raw ratio. Aggregate metadata identifies the contributing visit count and time span. Invalid or missing measurements clear that channel's history instead of treating failure as idle. Epoch, band and source changes clear the histories.
+
+Live replaces individual channels as observations arrive and retains other channels' last measurements while the next traversal is in progress. Starting a new cycle does not clear the whole chart. A known invalid/error result clears its channel; cycle closure removes unobserved channels, and advancing past a lost marker expires missing observations from that incomplete cycle. Sweep publishes staged results atomically at cycle completion. Retained results are last measurements, not evidence of continuous reception.
+Increasing the aggregate visit count changes the display's temporal averaging, not the physical integration window or accuracy. Increasing dwell alone does not add CCA windows; the configured attempt count controls that target.
 Capability availability means that the implementation supports this path, not that every window is valid.
 
 The hardware experiments support a clocked, gated busy-counter interpretation on the tested C5 and v6.0.3 SDK. They do not establish calibrated accuracy, the energy threshold, equivalence to MAC/NAV airtime, or whole-dwell utilization. An individual counter window was approximately 0.8 ms within a dwell of at least 120 ms. Its elapsed-time upper bound includes polling and software overhead, not just RF integration. Summing those bounds does not make it an exact integration duration. See the [counter investigation](esp32c5-spectrum-research.md#subsequent-cca-counter-experiments).

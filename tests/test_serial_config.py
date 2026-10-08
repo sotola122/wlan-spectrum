@@ -99,7 +99,8 @@ class SerialOpenConfigTests(unittest.TestCase):
                             "no CONFIG arrived after serial open")
             self.assertEqual(watch.configs[0],
                              {"mode": 1, "band": 1, "sweep_ms": 3000,
-                              "fft_size": 1024, "sample_rate_khz": 40000})
+                              "fft_size": 1024, "sample_rate_khz": 40000,
+                              "channel_dwell_ms": 0, "cca_attempts": 16})
             # exactly one CONFIG: no duplicate from a pre-open attempt and
             # none from an immediate re-send
             deadline = time.monotonic() + 0.3

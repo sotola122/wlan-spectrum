@@ -72,7 +72,7 @@ Known type codes (`KNOWN_TYPES`):
 | `0x02` | CH_UTIL | `u8 band, u8 n`, then `n` × `(u8 ch, u8 util_pct)` | `2 + 2n` |
 | `0x03` | STATUS | UTF-8 JSON object, or `<BBIIb` | JSON length, or `11` |
 | `0x04` | SPECTRUM_RF | `<IIBBBBHHII` header, then `n` × `<h` | `24 + 2n` |
-| `0x10` | CONFIG | `<BBHHI` | `10` |
+| `0x10` | CONFIG | `<BBHHIHB` | `13` |
 
 Any other type code is unknown. Payload length must be `≤ 8192`
 (`MAX_PAYLOAD`). A length of `8193` or more is rejected before the payload is
@@ -179,7 +179,9 @@ characters) and does this even while playback is paused.
 ### 3.4 `0x10` CONFIG (PC → device)
 
 Acquisition settings shared by the GUI, mock and firmware.
-Payload is exactly 10 bytes, `<BBHHI`:
+Payload is exactly 13 bytes, `<BBHHIHB`. This is one current version-1
+contract: update firmware and host together; the earlier 10-byte CONFIG is
+not accepted. STATUS remains `wifi-monitor/1`.
 
 | Offset | Field | Type | Meaning |
 |---|---|---|---|
@@ -188,6 +190,8 @@ Payload is exactly 10 bytes, `<BBHHI`:
 | 2 | `sweep_ms` | u16 | Requested sweep duration, milliseconds |
 | 4 | `fft_size` | u16 | FFT length, bins |
 | 6 | `sample_rate_khz` | u32 | Sample rate, kHz |
+| 10 | `channel_dwell_ms` | u16 | `0` = automatic; otherwise requested per-channel dwell, 120–2000 ms |
+| 12 | `cca_attempts` | u8 | Target distributed CCA attempts per dwell, 1–32 |
 
 GUI values that go into this frame:
 
@@ -198,6 +202,8 @@ GUI values that go into this frame:
 | `sweep_ms` | Sweep spin box | `100 … 10000`, step `100`, default `1000` |
 | `fft_size` | FFT size combo | `64` (default), `128`, `256`, `512`, `1024` |
 | `sample_rate_khz` | Sample rate combo | `20000` (`20 MS/s`, default) or `40000` (`40 MS/s`) |
+| `channel_dwell_ms` | Dwell control | `0` (Auto, default) or `120 … 2000` ms |
+| `cca_attempts` | CCA attempts control | `1 … 32`, default `16` |
 
 The sweep **count** limit (the Count spin box, `0` = unlimited) stays on the
 PC. It is not a CONFIG field.
@@ -210,9 +216,11 @@ live mode the mock still stores FFT size and sample rate, and still reports
 them in STATUS, but the live trace uses a fixed bin step (section 5) and does
 not follow those two fields.
 
-`struct.unpack` requires all 10 bytes. A shorter or longer payload fails the
+`struct.unpack` requires all 13 bytes. A shorter or longer payload fails the
 frame. Decode returns a plain dict with keys `mode`, `band`, `sweep_ms`,
-`fft_size`, `sample_rate_khz`.
+`fft_size`, `sample_rate_khz`, `channel_dwell_ms`, `cca_attempts`.
+Dwell and CCA controls describe physical acquisition; they do not turn Demo
+percentages into sampled PHY measurements.
 
 Demo shows a nominal bin spacing of `sample_rate_khz / fft_size` kHz.
 Packet-only firmware validates and echoes these fields without performing
@@ -289,7 +297,7 @@ The pinned C5 implementation carries experimental sampled PHY CCA counters
 in the optional STATUS `channel.util` object, using the same channel-event
 epoch and cycle. See [sampled PHY CCA](wifi-monitor.md#sampled-phy-cca) for its
 raw counter sums, valid/attempted counts and window-time upper bounds.
-The existing `wifi-monitor/1` contract pools up to eight valid windows distributed
+The existing `wifi-monitor/1` contract pools up to 32 valid windows distributed
 across a dwell, without a separate utilization-version field. It does not reuse
 Demo's `0x02 CH_UTIL` frames or claim whole-dwell airtime coverage.
 
@@ -314,7 +322,7 @@ A candidate header is 3 bytes. From a buffer of at least 3 bytes the parser:
 1. Reads `type` and `length`.
 2. If `type` is not one of `0x01`, `0x02`, `0x03`, `0x04`, `0x10`, or `length > 8192`,
    it deletes the first buffer byte, adds 1 to `errors`, and tries again.
-   It also rejects impossible type-specific lengths: CONFIG must be 10 bytes,
+   It also rejects impossible type-specific lengths: CONFIG must be 13 bytes,
    SPECTRUM must be at least 10 with an even number of sample bytes, and
    CH_UTIL must be at least 2 with an even number of entry bytes.
    SPECTRUM_RF must be 28–4096 bytes with `(length - 24) % 4 == 0`.
@@ -344,7 +352,7 @@ checksum arrive. The residual buffer is bounded by the maximum frame size,
 but recovery has no wall-clock bound when incoming traffic stops.
 CRC protects integrity; it does not remove this framing ambiguity.
 The firmware CONFIG-only parser rejects any header except type `0x10`, length
-`10`, and retains at most 17 bytes.
+`13`, and retains at most 20 bytes.
 
 Concrete decode failures that take the one-byte path:
 
@@ -355,7 +363,7 @@ Concrete decode failures that take the one-byte path:
 | CH_UTIL | Payload shorter than 2 bytes, or `len(payload) != 2 + 2n` |
 | STATUS JSON | First byte is `{` but the payload is not a single UTF-8 JSON value |
 | STATUS binary | First byte is not `{` and the payload is not exactly 11 bytes |
-| CONFIG | Payload is not exactly 10 bytes |
+| CONFIG | Payload is not exactly 13 bytes |
 | Any other | `type` not in the known set (also rejected in step 2, before decode) |
 
 ## 5. Frequency grids and bands
@@ -484,22 +492,25 @@ Two bins at 2412.0 MHz and 2412.5 MHz, `-54.25 dBm` and `-70.00 dBm`
 
 ### CONFIG
 
-Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s (`sample_rate_khz = 20000`).
+Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s (`sample_rate_khz = 20000`),
+automatic dwell and 16 CCA attempts.
 
 ```
-10 0a 00  01  01  e8 03  40 00  20 4e 00 00  95 56 4e 1d
+10 0d 00  01  01  e8 03  40 00  20 4e 00 00  00 00  10  2f 2a aa ff
 ```
 
 | Bytes | Field |
 |---|---|
 | `10` | type CONFIG |
-| `0a 00` | length = 10 |
+| `0d 00` | length = 13 |
 | `01` | mode = sweep |
 | `01` | band = 5 GHz |
 | `e8 03` | `sweep_ms` = 1000 |
 | `40 00` | `fft_size` = 64 |
 | `20 4e 00 00` | `sample_rate_khz` = 20000 |
-| `95 56 4e 1d` | CRC32 = `0x1D4E5695` |
+| `00 00` | `channel_dwell_ms` = 0 (Auto) |
+| `10` | `cca_attempts` = 16 |
+| `2f 2a aa ff` | CRC32 = `0xFFAA2A2F` |
 
 A live 2.4 GHz frame changes both identifiers and its checksum:
-`10 0a 00 00 00 e8 03 40 00 20 4e 00 00 e8 29 f7 e5`.
+`10 0d 00 00 00 e8 03 40 00 20 4e 00 00 00 00 10 c5 bf 99 b9`.

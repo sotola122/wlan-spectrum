@@ -7,9 +7,10 @@ CRC32-protected TLV frames. Real spectra use relative **dBFS**, not calibrated
 antenna-input dBm. Packet RSSI and AP sightings are separate protocol observations.
 Real and **Demo (mock)** sources use the same spectrum, peak-hold, waterfall
 and channel-utilization view. Real utilization is an experimental sampled PHY
-CCA counter ratio pooled from up to eight valid, distributed windows per dwell,
-with raw counter sums, valid/attempted counts and window-time bounds exposed in
-tooltips. It is not a whole-dwell average or established MAC/NAV airtime;
+CCA counter ratio from configurable distributed windows per dwell (1–32 attempts,
+default 16). The display can pool recent channel visits (default four), with the
+latest raw ratio, counter sums, valid/attempted counts and window-time bounds
+exposed separately in tooltips. It is not a whole-dwell average or established MAC/NAV airtime;
 invalid samples remain unavailable rather than becoming invented percentages.
 Each RF snapshot has its complex I/Q mean removed before windowing and FFT to
 suppress the receiver's center-frequency DC component. This also suppresses a
@@ -21,14 +22,12 @@ The screenshots below show synthetic Demo data, not measured RF spectra.
 - [Real monitor events and measurement semantics](docs/wifi-monitor.md).
 - [TLV framing, CRC32 and CONFIG](docs/tlv-protocol.md).
 
-The RF and sampled-CCA firmware passed EIM/Podman builds, USB-UART programming,
-Live/Sweep checks on both bands, separate ten-minute streams on each band, and
-the physical-device GUI harness on Linux (offscreen). The GUI test includes
-both-band waterfall history, measured utilization, configuration changes,
-pause, finite sweep count and reconnect. The combined suite passed 226 tests.
-See the firmware workflow for revision-specific acceptance results and transport
-limitations. Windows validation is performed separately; these Linux tests do
-not establish Windows operation or calibrated RF accuracy.
+The [firmware workflow](docs/firmware.md#hardware-verification) records
+revision-specific EIM/Podman builds, USB-UART programming, both-band Live/Sweep
+checks and physical-device GUI tests on Linux (offscreen), including failures
+and transport limitations. Earlier images' long-run results do not verify later
+changes. Windows validation is performed separately; Linux tests do not establish
+Windows operation or calibrated RF accuracy.
 
 ![2.4 GHz live](docs/screenshot_cursor_24.png)
 ![5 GHz band sweep](docs/screenshot_cursor_5.png)
@@ -131,6 +130,38 @@ cycle marker. Missing capture regions are gaps rather than a generated floor.
 
 Mouse wheel / drag zooms and pans the frequency axis on all three plots together.
 
+### Measurement and display settings
+
+Measurement settings change device acquisition; display settings do not send CONFIG.
+
+| Setting | Range / default | Meaning |
+|---|---|---|
+| Channel dwell | Auto, or 120–2000 ms; default Auto | Requested receive time per channel; the effective target also reserves 5 ms per CCA attempt |
+| CCA attempts | 1–32; default 16 | Target short PHY-counter windows distributed across a dwell; invalid or missed windows are reported, not invented |
+| Display refresh | 5–60 FPS; default 30 | Repaint rate, not the measurement or serial receive rate |
+| Waterfall history | 50–1000 rows; default 200 | Retained display history |
+| Utilization visits | 1–16; default 4 | Counter-weighted aggregation of recent valid visits per channel; 1 shows the latest raw result |
+
+Live retains the last result for other channels while the next scan visits them.
+Invalid measurements and channels missing from a completed cycle remain unavailable,
+not zero. Sweep publishes a completed cycle together. Tooltips distinguish the
+latest raw measurement from the displayed aggregate and its contributing visits.
+Longer averaging can make the display steadier; it does not improve RF calibration
+or turn intermittent samples into continuous channel coverage.
+
+Click **Apply** to send the selected dwell and CCA-attempt settings. Changes to
+FFT size, sample rate and Sweep time are sent after a short editing pause;
+each request includes all seven selected acquisition fields.
+Display refresh, history and aggregation changes take effect locally without CONFIG.
+Resizing history preserves the newest rows that fit and does not reset other measurements.
+
+Mode, band, Sweep time, FFT size, sample rate, dwell, CCA attempts and the three
+display settings are saved locally. Port names, USB identifiers and automatic
+connection/start are not saved. **Reset defaults** restores the saved selections;
+use **Apply** to send them to a connected device.
+The effective dwell and measured cycle time are read back separately: the requested
+Sweep time is not a guaranteed wall-clock cycle period.
+
 ## TLV protocol
 
 Every frame: `type u8 | length u16 LE | payload[length] | crc32 u32 LE`.
@@ -144,17 +175,37 @@ Field layouts, resync rules, and byte examples: [`docs/tlv-protocol.md`](docs/tl
 | `0x02` CH_UTIL | Demo→PC | `band u8 (0=2.4, 1=5), n u8, n × (ch u8, util_pct u8)` |
 | `0x03` STATUS | dev→PC | Real firmware: `wifi-monitor/1` JSON events. Codec also supports Demo JSON and binary status. |
 | `0x04` SPECTRUM_RF | dev→PC | Epoch/cycle, band/channel/mode, rate code, FFT size/source, center/span in kHz, then int16 dBFS×100 bins |
-| `0x10` CONFIG | PC→dev | `mode u8 (0=live,1=sweep), band u8, sweep_ms u16, fft_size u16, sample_rate_khz u32` |
+| `0x10` CONFIG | PC→dev | `mode u8 (0=live,1=sweep), band u8, sweep_ms u16, fft_size u16, sample_rate_khz u32, channel_dwell_ms u16, cca_attempts u8` |
 
 * Demo spectrum frames may cover the whole band (live) or a segment (sweep); the GUI
   resamples them onto its display grid (2.4 GHz: 2400–2500 MHz @ 0.5 MHz,
   5 GHz: 5150–5895 MHz @ 1 MHz).
 * In Demo band-sweep mode a sweep is counted complete when a segment reaching the top
   of the band arrives; then a waterfall row is added.
-* CONFIG is sent on connect and whenever mode / band / sweep time / FFT / sample
-  rate change.
+* CONFIG has one current 13-byte version-1 payload. Update firmware and GUI
+  together; the earlier 10-byte payload is rejected, with no compatibility branch.
 * Real monitoring uses explicit configuration epochs and cycle events, not the
   Demo frequency heuristic. Packet rate is not a utilization percentage.
+
+## Publication privacy
+
+Keep device serials, MAC addresses, USB inventories/registry exports, personal
+paths and real captures out of source, documentation and screenshots. Supply
+`PORT` and `JTAG_SERIAL` locally; the Make targets refuse an unspecified device.
+Set `IDF_PATH` locally for optional SDK-header checks in native tests.
+Store local evidence under an ignored directory such as `.local/` or `captures/`.
+
+Before committing, run `python3 scripts/check_public_files.py`. To enable the
+staged-file check locally, run `git config --local core.hooksPath .githooks`
+(integrate with an existing hook instead of replacing it). GitHub Actions also
+checks the committed snapshot. The check reports paths and rule names, not the
+matched values. It detects common machine identifiers; it is not a comprehensive
+secret scanner and does not inspect image pixels. Review screenshots manually
+and use synthetic Demo data for public examples.
+
+Deleting a published value in a later commit does not remove it from Git
+history. History cleanup requires coordinated rewriting and updating other
+clones; cached GitHub views or third-party copies can remain accessible.
 
 ## Files
 
@@ -179,7 +230,8 @@ wifi_spectrum/
 * Raw I/Q capture uses a private PHY entry point pinned to ESP-IDF v6.0.3.
   It is a sequence of snapshots, not continuous whole-band acquisition.
   dBFS is not calibrated dBm; gain, frequency response and absolute RF accuracy
-  are unqualified. CCA utilization remains unavailable.
+  are unqualified. CCA is an experimental sampled estimate, not calibrated
+  whole-dwell or MAC/NAV airtime.
 * Mock data is synthetic (OFDM-like masks, duty-cycled APs, BT hops, microwave
   hump), not a model of real ESP32-C5 CSI/RSSI measurements.
 * The real JP receive allowlist differs from the Demo grid; see the monitor

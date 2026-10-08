@@ -35,17 +35,19 @@ extern void phy_set_cca_cnt(uint32_t counter_limit, uint32_t arm);
 
 #define CCA_COUNTER_MASK 0x07ffffffu
 
-/* Per-dwell pooled CCA state (CURRENT contract, no version key): EIGHT
- * distributed one-shot attempts at j*dwell/8, each strictly validated. */
-#define CCA_SLOTS 8u
+/* Per-dwell pooled CCA state (CURRENT contract, no version key): up to
+ * attempt_count (1..32, default 16) one-shot attempts distributed over
+ * [0, dwell - 5000us), each strictly validated. */
+#define CCA_ATTEMPTS_MAX 32u
 typedef struct {
     bool dwell_open;            /* dwell open: ticks may schedule */
+    uint8_t attempt_count;      /* configured windows this dwell, 1..32 */
     uint8_t next_slot;          /* lowest slot index still pendable */
-    uint8_t attempted_windows;  /* windows actually attempted, <=8 */
+    uint8_t attempted_windows;  /* windows actually attempted, <=32 */
     uint8_t valid_windows;      /* windows that passed validation */
-    uint32_t busy_sum_ticks;    /* sum of valid busy_ticks: <= 8 x mask */
-    uint32_t total_sum_ticks;   /* sum of valid totals: <= 8 x mask */
-    uint32_t window_sum_us;     /* sum of valid brackets: <= 40000 */
+    uint32_t busy_sum_ticks;    /* sum of valid busy: <= 32 x mask < 2^32 */
+    uint32_t total_sum_ticks;   /* sum of valid totals: <= 32 x mask */
+    uint32_t window_sum_us;     /* sum of valid brackets: <= 160000 */
 } CcaState;   /* APP-TASK-ONLY: begin / finish / tick. */
 
 static void cca_attempt_once(void);   /* defined below monitor_radio_begin */
@@ -198,11 +200,18 @@ esp_err_t monitor_radio_init(void) {
     return esp_wifi_set_promiscuous_rx_cb(promiscuous_callback);
 }
 
-esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel) {
+esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel,
+                              uint8_t cca_attempts) {
     /* Invalidate any previous CCA window at ENTRY: a failed or repeated
      * begin can never leave a stale window for a later finish to reuse.
      * Only the CCA pool resets — lock and queue stay untouched. */
     radio_state.cca = (CcaState){0};
+    /* Defensive clamp: config validation requires 1..32; 0 falls back to
+     * the documented default instead of scheduling zero windows. */
+    radio_state.cca.attempt_count =
+        cca_attempts == 0 ? MONITOR_CCA_ATTEMPTS_DEFAULT
+        : (cca_attempts > CCA_ATTEMPTS_MAX ? CCA_ATTEMPTS_MAX
+                                           : cca_attempts);
     esp_err_t err = esp_wifi_set_promiscuous(false);
     if (err != ESP_OK) {
         return err;
@@ -238,7 +247,7 @@ esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel) {
     }
     radio_state.start_us = esp_timer_get_time();  /* reception enabled before timing */
     /* Pooled CCA: activate scheduling and attempt slot 0 at the dwell
-     * start. Ticks 1..7 are scheduled from ACTUAL elapsed time by
+     * start. Remaining slots are scheduled from ACTUAL elapsed time by
      * monitor_radio_cca_tick. */
     radio_state.cca.dwell_open = true;
     cca_attempt_once();
@@ -308,14 +317,16 @@ static void cca_attempt_once(void) {
                  busy_ticks <= total;
     if (valid) {
         radio_state.cca.valid_windows++;
-        radio_state.cca.busy_sum_ticks += busy_ticks;   /* <= mask; total <= 8xmask */
+        radio_state.cca.busy_sum_ticks += busy_ticks;   /* <= mask; <= 32x */
         radio_state.cca.total_sum_ticks += total;
-        radio_state.cca.window_sum_us += window_us;  /* <=5000; total <=40000 */
+        radio_state.cca.window_sum_us += window_us;  /* <=5000; <=160000 */
     }
 }
 
 void monitor_radio_cca_tick(uint32_t dwell_ms) {
-    if (!radio_state.cca.dwell_open || radio_state.cca.next_slot >= CCA_SLOTS || dwell_ms == 0) {
+    if (!radio_state.cca.dwell_open ||
+        radio_state.cca.next_slot >= radio_state.cca.attempt_count ||
+        dwell_ms == 0) {
         return;                        /* no dwell, done, or nothing due */
     }
     int64_t elapsed = esp_timer_get_time() - radio_state.start_us;
@@ -333,18 +344,30 @@ void monitor_radio_cca_tick(uint32_t dwell_ms) {
      * lower attempt count is reported honestly by attempted. Bound: the
      * multiplication below is safe because elapsed_us < dwell_us <=
      * UINT32_MAX * 1000 before it (guard above, not an assumption). */
-    if (dwell_us - elapsed_us < (uint64_t)CCA_UTIL_WINDOW_BUDGET_US) {
-        return;
+    if (dwell_us <= (uint64_t)CCA_UTIL_WINDOW_BUDGET_US ||
+        dwell_us - elapsed_us < (uint64_t)CCA_UTIL_WINDOW_BUDGET_US) {
+        return;                        /* end-of-dwell tail: nothing due
+                                        * (also bounds sched_us >= 1) */
     }
-    /* slot = floor(elapsed_us * 8 / dwell_us); elapsed_us < dwell_us makes
-     * the result 0..7 without further range claims. */
-    uint64_t slot = elapsed_us * CCA_SLOTS / dwell_us;
+    /* Slots are distributed over [0, dwell - budget): dividing by
+     * sched_us (>= 1 by the guard above) reserves the full window budget
+     * for the last slot, so every due slot still fits its window. The
+     * result is 0..attempt_count-1 while elapsed_us < sched_us. */
+    uint64_t sched_us = dwell_us - (uint64_t)CCA_UTIL_WINDOW_BUDGET_US;
+    uint64_t slot = elapsed_us * radio_state.cca.attempt_count / sched_us;
+    if (slot >= radio_state.cca.attempt_count) {
+        return;  /* exact boundary slot == count: out of range, skip */
+    }
     if (slot < radio_state.cca.next_slot) {
         return;                        /* not due / already sampled: no new
                                         * attempt, never a burst */
     }
     radio_state.cca.next_slot = (uint8_t)(slot + 1u);
     cca_attempt_once();                /* at most ONE window per tick */
+}
+
+int64_t monitor_radio_receive_start_us(void) {
+    return radio_state.start_us;
 }
 
 void monitor_radio_finish(MonitorObservation *out) {

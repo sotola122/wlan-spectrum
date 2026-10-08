@@ -85,11 +85,13 @@ def header_text(win: MainWindow, col: int) -> str:
 def check_util_column(win: MainWindow, synthetic: bool) -> None:
     """Real utilization acceptance (physical --port AND PTY): contract
     facts only for the ambient path - nonempty valid raw samples, the
-    exact 100*busy/total mapping into cells/bar heights, pooled-window
-    identification plus raw valid/attempted metadata in the tooltip, no
-    percent without raw data, the honest UNAVAILABLE state (a legitimate all-zero
-    real snapshot passes). synthetic=True (PTY/unit) additionally runs
-    the fixture-property regression checks at the end."""
+    exact aggregate SUM(busy)/SUM(total) mapping into cells/bar heights,
+    pooled-window identification plus raw valid/attempted metadata (and
+    the aggregate sums when averaging) in the tooltip, no percent
+    without raw data, the honest UNAVAILABLE state (a legitimate
+    all-zero real snapshot passes). synthetic=True (PTY/unit)
+    additionally runs the fixture-property regression checks at the
+    end."""
     channels = BANDS[win.band].channels
     cells = [cell_text(win, r, 2) for r in range(win.ch_table.rowCount())]
     if not win.monitor_state.utilization_available:
@@ -113,7 +115,7 @@ def check_util_column(win: MainWindow, synthetic: bool) -> None:
           "util bar series must match the channel list")
     check(all(abs(float(a) - float(b)) < 1e-6
               for a, b in zip(heights, expected_h, strict=True)),
-          "bar heights must equal the raw 100*busy/total values")
+          "bar heights must equal the aggregate display values")
     for r, ch in enumerate(channels):
         item = win.ch_table.item(r, 2)
         text = item.text() if item is not None else ""
@@ -122,9 +124,15 @@ def check_util_column(win: MainWindow, synthetic: bool) -> None:
             if sample is None:
                 raise HarnessError(
                     f"ch {ch}: rendered without a raw sample")
-            check(win._util[ch]
-                  == 100.0 * sample["busy"] / sample["total"],
-                  f"ch {ch}: display value must equal 100*busy/total")
+            use = (win.monitor_state.util_history.get(ch, [])
+                   [-win._util_agg:])
+            expect = (100.0 * sum(e[1] for e in use)
+                      / sum(e[2] for e in use)
+                      if use else
+                      100.0 * sample["busy"] / sample["total"])
+            check(win._util[ch] == expect,
+                  f"ch {ch}: display value must equal the aggregate "
+                  "SUM(busy)/SUM(total) over the latest visits")
             check(text == f"{win._util[ch]:.0f} %",
                   f"ch {ch}: cell must show the rounded percent, "
                   f"got {text!r}")
@@ -138,6 +146,11 @@ def check_util_column(win: MainWindow, synthetic: bool) -> None:
             check(f"{sample['samples']} valid of "
                   f"{sample['attempted']} attempted" in tip,
                   f"ch {ch}: tooltip must show valid/attempted counts")
+            if len(use) > 1:
+                check(f"sum busy {sum(e[1] for e in use)} / sum total "
+                      f"{sum(e[2] for e in use)}" in tip,
+                      f"ch {ch}: tooltip must expose the aggregate sums "
+                      "when averaging visits")
         else:
             check(text in ("—", ""),
                   f"ch {ch}: absent raw sample must render no percent "
@@ -229,10 +242,17 @@ class SyntheticDevice(threading.Thread):
             "schema": "wifi-monitor/1", "event": "config",
             "fw": "synthetic-rf-0.1", "idf": "v6.0.3",
             "chip": "ESP32-C5", "country": "JP", "epoch": self.epoch,
-            "dwell_ms": 120, "channels": SYNTHETIC_CHANNELS[band],
+            # effective dwell mirrors the FW rule: max(120, explicit
+            # channel_dwell_ms, 5 * attempts) so nondefault attempts are
+            # visible in the ack
+            "dwell_ms": max(120, int(cfg.get("channel_dwell_ms", 0) or 0),
+                            5 * int(cfg.get("cca_attempts", 16))),
+            "channels": SYNTHETIC_CHANNELS[band],
             "tx_dropped": 0, "mode": cfg["mode"], "band": band,
             "sweep_ms": cfg["sweep_ms"], "fft_size": cfg["fft_size"],
             "sample_rate_khz": cfg["sample_rate_khz"],
+            "channel_dwell_ms": cfg.get("channel_dwell_ms", 0),
+            "cca_attempts": cfg.get("cca_attempts", 16),
             "spectrum": True,
             "spectrum_caps": {"source": "c5_snapshot_iq_fft",
                               "fft_sizes": SYNTH_FFT_SIZES,
@@ -530,9 +550,14 @@ def step_fft_rate_requests(win: MainWindow, shots, writes) -> None:
     else:
         base = len(writes)
         win.sr_combo.setCurrentText(target_rate)
-        wait(lambda: len(writes) > base, 5.0, "CONFIG after rate change")
+        want = int(target_rate.split()[0]) * 1000
+        # wait for CONTENT: a retry of the previous tuple may land first;
+        # the debounced latest request must eventually be on the wire
+        wait(lambda: config_from_frame(writes[-1])["sample_rate_khz"]
+             == want or len(writes) > base + 3,
+             5.0, "CONFIG carrying the requested rate")
         last = config_from_frame(writes[-1])
-        check(last["sample_rate_khz"] == int(target_rate.split()[0]) * 1000,
+        check(last["sample_rate_khz"] == want,
               f"CONFIG carries span for {target_rate}, got {last}")
     # the effective ack must match BOTH the explicit request and the caps
     want_fft = int(target_fft or current_fft)
@@ -681,6 +706,38 @@ def step_demo_restore(win: MainWindow, shots) -> None:
 
 
 # ----------------------------------------------------------------- main
+def step_settings_nondefault(win: MainWindow, shots, writes) -> None:
+    """Physical-ready: nondefault dwell/attempts travel as ONE Apply
+    CONFIG (7 fields), the device's matching echo is accepted, and a
+    display-only knob change never emits a CONFIG."""
+    base = len(writes)
+    win.attempts_spin.setValue(7)
+    win.dwell_spin.setValue(300)
+    win.apply_btn.click()
+    wait(lambda: len(writes) > base, 5.0,
+         "Apply CONFIG with nondefault dwell/attempts")
+    sent = config_from_frame(writes[-1])
+    check(sent.get("cca_attempts") == 7,
+          f"CONFIG must carry cca_attempts 7, got {sent}")
+    check(sent.get("channel_dwell_ms") == 300,
+          f"CONFIG must carry channel_dwell_ms 300, got {sent}")
+    # effective dwell readback follows the nondefault request
+    # (max(120, 300, 5*7) = 300)
+    wait(lambda: win.monitor_state.dwell_ms == 300, 5.0,
+         "ack echoing the nondefault effective dwell 300")
+    # display-only: FPS change must not emit any CONFIG
+    before = len(writes)
+    win.fps_spin.setValue(45)
+    deadline = time.monotonic() + 0.8       # > debounce + retry window
+    while time.monotonic() < deadline:
+        APP.processEvents()
+        time.sleep(0.01)
+    check(len(writes) == before,
+          f"display-only FPS change must not send CONFIG ({before} -> "
+          f"{len(writes)})")
+    print("[ok] nondefault dwell/attempt Apply + display-only isolation")
+
+
 def run_harness(port: str, baud: int, shots_dir: str | None,
                 ready_timeout: float) -> int:
     from pathlib import Path
@@ -717,6 +774,8 @@ def run_harness(port: str, baud: int, shots_dir: str | None,
         ("display controls", lambda: step_display_controls(win, shots)),
         ("fft/rate controls",
          lambda: step_fft_rate_requests(win, shots, writes)),
+        ("settings nondefault",
+         lambda: step_settings_nondefault(win, shots, writes)),
         ("sweep + count", lambda: step_sweep_cycle_and_count(win, shots)),
         ("5 GHz band", lambda: step_band5g(win, shots)),
         ("pause/resume", lambda: step_pause_resume(win)),

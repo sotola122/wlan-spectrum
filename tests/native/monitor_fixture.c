@@ -19,22 +19,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Documented CONFIG vector (docs/tlv-protocol.md): Band Sweep, 5 GHz,
- * 1000 ms, FFT 64, 20 MS/s, with the published CRC32 95 56 4e 1d appended.
- * The checksum bytes are literal spec data, never manufactured here. */
+/* CURRENT CONFIG vector: Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s,
+ * channel_dwell_ms = 240, cca_attempts = 16; payload <BBHHIHB> (13 bytes),
+ * CRC32 ff 59 6e 4a over header+payload (recomputed for the appended
+ * fields; the parse acceptance below re-verifies it every run). */
 static const uint8_t k_config_frame[MONITOR_CONFIG_STREAM_BYTES] = {
-    0x10, 0x0a, 0x00, 0x01, 0x01, 0xe8, 0x03, 0x40, 0x00,
-    0x20, 0x4e, 0x00, 0x00, 0x95, 0x56, 0x4e, 0x1d,
+    0x10, 0x0d, 0x00, 0x01, 0x01, 0xe8, 0x03, 0x40, 0x00,
+    0x20, 0x4e, 0x00, 0x00, 0xf0, 0x00, 0x10, 0xff, 0x59, 0x6e, 0x4a,
 };
 
 /* Recompute the checksum after mutating a frame under test, so the parser
  * exercises field validation rather than CRC rejection. */
 static void fix_crc(uint8_t *frame) {
     uint32_t crc = monitor_crc32(frame, MONITOR_CONFIG_FRAME_BYTES);
-    frame[13] = (uint8_t)(crc & 0xffu);
-    frame[14] = (uint8_t)((crc >> 8) & 0xffu);
-    frame[15] = (uint8_t)((crc >> 16) & 0xffu);
-    frame[16] = (uint8_t)((crc >> 24) & 0xffu);
+    frame[16] = (uint8_t)(crc & 0xffu);
+    frame[17] = (uint8_t)((crc >> 8) & 0xffu);
+    frame[18] = (uint8_t)((crc >> 16) & 0xffu);
+    frame[19] = (uint8_t)((crc >> 24) & 0xffu);
 }
 
 static bool feed_bytes(const uint8_t *bytes, size_t count,
@@ -66,7 +67,8 @@ static void selftest_config(void) {
             assert(monitor_config_feed(&parser, k_config_frame[i], &cfg) == last);
         }
         assert(cfg.mode == 1 && cfg.band == 1 && cfg.sweep_ms == 1000 &&
-               cfg.fft_size == 64 && cfg.sample_rate_khz == 20000);
+               cfg.fft_size == 64 && cfg.sample_rate_khz == 20000 &&
+               cfg.channel_dwell_ms == 240 && cfg.cca_attempts == 16);
         assert(parser.used_bytes == 0);
     }
 
@@ -118,7 +120,7 @@ static void selftest_config(void) {
         assert(cfg.mode == 0 && cfg.band == 0 && cfg.sweep_ms == 1000);
     }
 
-    /* Legacy CRC-less frame (13 bytes only): rejected, config unchanged. */
+    /* Legacy CRC-less frame (header+payload only): rejected, unchanged. */
     {
         MonitorConfigParser parser;
         MonitorConfig cfg = {0};
@@ -141,7 +143,7 @@ static void selftest_config(void) {
         monitor_config_parser_init(&parser);
         uint8_t bad[MONITOR_CONFIG_STREAM_BYTES];
         memcpy(bad, k_config_frame, sizeof(bad));
-        bad[16] ^= 0xffu;               /* flip one checksum bit */
+        bad[MONITOR_CONFIG_STREAM_BYTES - 1] ^= 0xffu;  /* flip a CRC bit */
         for (size_t i = 0; i < sizeof(bad); i++) {
             assert(!monitor_config_feed(&parser, bad[i], &cfg));
         }
@@ -212,6 +214,10 @@ static void selftest_config(void) {
             {{7}, {0x02}, 1},            /* fft_size = 2 */
             {{9}, {0x00}, 1},            /* sample_rate_khz = 19968 */
             {{10}, {0x01}, 1},           /* sample_rate_khz = 288 */
+            {{13, 14}, {0x77, 0x00}, 2}, /* channel_dwell_ms = 119 */
+            {{13, 14}, {0xd1, 0x07}, 2}, /* channel_dwell_ms = 2001 */
+            {{15}, {0x00}, 1},           /* cca_attempts = 0 */
+            {{15}, {0x21}, 1},           /* cca_attempts = 33 */
         };
         for (size_t c = 0; c < sizeof(corruptions) / sizeof(corruptions[0]); c++) {
             memcpy(bad, k_config_frame, sizeof(bad));
@@ -230,7 +236,50 @@ static void selftest_config(void) {
         assert(monitor_config_equal(&cfg, &before));
     }
 
-    /* Buffer bound: parser never exceeds its 17-byte array (checked by
+    /* Appended-field extremes are accepted exactly when in range. */
+    {
+        MonitorConfigParser parser;
+        MonitorConfig cfg = {0};
+        monitor_config_parser_init(&parser);
+        uint8_t v[MONITOR_CONFIG_STREAM_BYTES];
+        size_t at = 0;
+        memcpy(v, k_config_frame, sizeof(v));
+        v[13] = 0x78; v[14] = 0x00;     /* channel_dwell_ms = 120 */
+        v[15] = 0x01;                   /* cca_attempts = 1 */
+        fix_crc(v);
+        assert(feed_bytes(v, sizeof(v), &parser, &cfg, &at));
+        assert(cfg.channel_dwell_ms == 120 && cfg.cca_attempts == 1);
+        memcpy(v, k_config_frame, sizeof(v));
+        v[13] = 0xd0; v[14] = 0x07;     /* channel_dwell_ms = 2000 */
+        v[15] = 0x20;                   /* cca_attempts = 32 */
+        fix_crc(v);
+        assert(feed_bytes(v, sizeof(v), &parser, &cfg, &at));
+        assert(cfg.channel_dwell_ms == 2000 && cfg.cca_attempts == 32);
+        memcpy(v, k_config_frame, sizeof(v));
+        v[13] = 0x00; v[14] = 0x00;     /* channel_dwell_ms = 0 (AUTO) */
+        fix_crc(v);
+        assert(feed_bytes(v, sizeof(v), &parser, &cfg, &at));
+        assert(cfg.channel_dwell_ms == 0 && cfg.cca_attempts == 16);
+    }
+
+    /* Ack/retry equality spans ALL seven fields. */
+    {
+        MonitorConfigParser parser;
+        MonitorConfig cfg = {0};
+        monitor_config_parser_init(&parser);
+        assert(feed_bytes(k_config_frame, MONITOR_CONFIG_STREAM_BYTES, &parser,
+                          &cfg, &(size_t){0}));
+        MonitorConfig same = cfg;
+        assert(monitor_config_equal(&cfg, &same));
+        same.cca_attempts = (uint8_t)(cfg.cca_attempts == 16 ? 15 : 16);
+        assert(!monitor_config_equal(&cfg, &same));
+        same = cfg;
+        same.channel_dwell_ms =
+            (uint16_t)(cfg.channel_dwell_ms == 0 ? 120 : 0);
+        assert(!monitor_config_equal(&cfg, &same));
+    }
+
+    /* Buffer bound: parser never exceeds its 20-byte array (checked by
      * ASan/UBSan runs as well). */
     {
         MonitorConfigParser parser;
@@ -279,9 +328,11 @@ static int run_config_parse(const char *hex) {
         fprintf(stderr, "config not accepted\n");
         return 1;
     }
-    printf("mode=%u band=%u sweep_ms=%u fft_size=%u sample_rate_khz=%lu\n",
+    printf("mode=%u band=%u sweep_ms=%u fft_size=%u sample_rate_khz=%lu "
+           "channel_dwell_ms=%u cca_attempts=%u\n",
            cfg.mode, cfg.band, cfg.sweep_ms, cfg.fft_size,
-           (unsigned long)cfg.sample_rate_khz);
+           (unsigned long)cfg.sample_rate_khz, cfg.channel_dwell_ms,
+           cfg.cca_attempts);
     return 0;
 }
 
@@ -466,11 +517,14 @@ static const uint8_t k_jp_24[13] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
 
 static int scenario_config_event(void) {
     char json[MONITOR_JSON_CAPACITY_BYTES];
+    MonitorConfig config = {.mode = 0, .band = 0, .sweep_ms = 1000,
+                            .fft_size = 64, .sample_rate_khz = 20000,
+                            .channel_dwell_ms = 0,
+                            .cca_attempts = MONITOR_CCA_ATTEMPTS_DEFAULT};
     MonitorConfigEvent event = {
         .epoch = 1,
-        .config = {.mode = 0, .band = 0, .sweep_ms = 1000,
-                   .fft_size = 64, .sample_rate_khz = 20000},
-        .dwell_ms = monitor_dwell_ms(1000, 13),
+        .config = config,
+        .dwell_ms = monitor_dwell_ms(&config, 13),
         .channels = k_jp_24,
         .channel_count = 13,
         .tx_dropped = 0,
@@ -731,13 +785,14 @@ static void selftest_crc(void) {
     const uint8_t check[] = "123456789";
     assert(monitor_crc32(check, 9) == 0xcbf43926u);
 
-    /* Golden CONFIG frame from the wire spec: CRC bytes 95 56 4e 1d. */
+    /* Current CONFIG vector CRC-32/ISO-HDLC over header + 13-byte
+     * payload: bytes ff 59 6e 4a (0x4a6e59ff). */
     uint32_t crc = monitor_crc32(k_config_frame, MONITOR_CONFIG_FRAME_BYTES);
-    assert(crc == 0x1d4e5695u);
-    assert(k_config_frame[13] == (uint8_t)(crc & 0xffu));
-    assert(k_config_frame[14] == (uint8_t)((crc >> 8) & 0xffu));
-    assert(k_config_frame[15] == (uint8_t)((crc >> 16) & 0xffu));
-    assert(k_config_frame[16] == (uint8_t)((crc >> 24) & 0xffu));
+    assert(crc == 0x4a6e59ffu);
+    assert(k_config_frame[16] == (uint8_t)(crc & 0xffu));
+    assert(k_config_frame[17] == (uint8_t)((crc >> 8) & 0xffu));
+    assert(k_config_frame[18] == (uint8_t)((crc >> 16) & 0xffu));
+    assert(k_config_frame[19] == (uint8_t)((crc >> 24) & 0xffu));
 
     /* Empty input: defined init/xorout result. */
     assert(monitor_crc32(NULL, 0) == 0u);
@@ -876,9 +931,26 @@ int main(int argc, char **argv) {
         return run_config_parse(argv[2]);
     }
     if (strcmp(argv[1], "dwell") == 0) {
-        printf("%lu %lu %lu\n", (unsigned long)monitor_dwell_ms(1000, 13),
-               (unsigned long)monitor_dwell_ms(10000, 20),
-               (unsigned long)monitor_dwell_ms(1000, 0));
+        /* auto floor / auto sweep / no channels / cca floor (32 -> 160) /
+         * explicit override / explicit+cca competing (max wins) */
+        MonitorConfig auto_cfg = {.sweep_ms = 1000, .channel_dwell_ms = 0,
+                                  .cca_attempts = 16};
+        MonitorConfig big_cfg = {.sweep_ms = 10000, .channel_dwell_ms = 0,
+                                 .cca_attempts = 16};
+        MonitorConfig cca32_cfg = {.sweep_ms = 1000, .channel_dwell_ms = 0,
+                                   .cca_attempts = 32};
+        MonitorConfig explicit_cfg = {.sweep_ms = 1000,
+                                      .channel_dwell_ms = 1500,
+                                      .cca_attempts = 16};
+        MonitorConfig both_cfg = {.sweep_ms = 1000, .channel_dwell_ms = 150,
+                                  .cca_attempts = 32};
+        printf("%lu %lu %lu %lu %lu %lu\n",
+               (unsigned long)monitor_dwell_ms(&auto_cfg, 13),
+               (unsigned long)monitor_dwell_ms(&big_cfg, 20),
+               (unsigned long)monitor_dwell_ms(&auto_cfg, 0),
+               (unsigned long)monitor_dwell_ms(&cca32_cfg, 13),
+               (unsigned long)monitor_dwell_ms(&explicit_cfg, 13),
+               (unsigned long)monitor_dwell_ms(&both_cfg, 13));
         return 0;
     }
     if (strcmp(argv[1], "selftest") == 0 && argc == 3) {

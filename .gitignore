@@ -53,7 +53,15 @@ managed_components/
 sdkconfig
 sdkconfig.old
 
-# Manual/EIM build logs (repo evidence logs live under .hermes/, self-ignored)
+# Local evidence, device inventories and agent histories are never public.
+.hermes/
+.local/
+captures/
+*.raw.bin
+*.reg
+shots-win/
+
+# Manual/EIM build logs
 *.log
 
 # --- Editor / OS junk ---

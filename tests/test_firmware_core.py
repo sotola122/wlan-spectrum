@@ -8,6 +8,7 @@ Wire scenarios emit real TLV bytes decoded by wifi_spectrum.tlv.TlvParser.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import unittest
@@ -38,7 +39,7 @@ CFLAGS = ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O1",
 
 # Literal documented CONFIG: Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s,
 # with the spec-published CRC32 bytes 95 56 4e 1d (docs/tlv-protocol.md).
-CONFIG_HEX = "100a000101e8034000204e000095564e1d"
+CONFIG_HEX = "100d000101e8034000204e0000f00010ff596e4a"
 
 
 def _require_cc() -> str:
@@ -159,7 +160,8 @@ class FirmwareCoreTests(unittest.TestCase):
         out = _run(self.exe, "config-parse", CONFIG_HEX).decode()
         self.assertEqual(
             out.strip(),
-            "mode=1 band=1 sweep_ms=1000 fft_size=64 sample_rate_khz=20000")
+            "mode=1 band=1 sweep_ms=1000 fft_size=64 sample_rate_khz=20000 "
+            "channel_dwell_ms=240 cca_attempts=16")
 
     def test_config_every_split_byte_at_a_time_and_noise(self) -> None:
         # The fixture itself walks every split point, a byte-at-a-time feed,
@@ -168,8 +170,10 @@ class FirmwareCoreTests(unittest.TestCase):
         _run(self.exe, "selftest", "config")
 
     def test_dwell_boundaries(self) -> None:
+        # auto floor / auto sweep / no channels / cca floor (32 -> 160 ms) /
+        # explicit override / explicit+cca competing (max wins)
         out = _run(self.exe, "dwell").decode().split()
-        self.assertEqual(out, ["120", "500", "0"])
+        self.assertEqual(out, ["120", "500", "0", "160", "1500", "160"])
 
     # ------------------------------------------------------- ap parsing
     def test_ap_parsing_cases(self) -> None:
@@ -254,6 +258,11 @@ class FirmwareCoreTests(unittest.TestCase):
         self.assertEqual(data["sweep_ms"], 1000)
         self.assertEqual(data["fft_size"], 64)
         self.assertEqual(data["sample_rate_khz"], 20000)
+        # ONE v1 CONFIG: the ack echoes BOTH requested new fields and the
+        # effective dwell (defaults: AUTO dwell, 16 CCA attempts).
+        self.assertEqual(data["channel_dwell_ms"], 0)
+        self.assertEqual(data["cca_attempts"], 16)
+        self.assertEqual(data["dwell_ms"], 120)
 
     def test_cycle_and_error_events_wire(self) -> None:
         for mode, expect in (
@@ -394,9 +403,10 @@ class AdapterSeamTests(unittest.TestCase):
     def test_uart_transport_config(self) -> None:
         # UART0 @921600 on SoC-default pins; fake constants must mirror the
         # real IDF C5 header when it exists (no guessed pins).
-        real = Path("<LOCAL_HOME>/.espressif/v6.0.3/esp-idf/components/soc/"
-                    "esp32c5/include/soc/uart_pins.h")
-        if real.exists():
+        sdk = os.environ.get("IDF_PATH")
+        real = (Path(sdk) / "components/soc/esp32c5/include/soc/uart_pins.h"
+                if sdk else None)
+        if real is not None and real.exists():
             text = real.read_text()
             self.assertIn("#define U0TXD_GPIO_NUM 11", text)
             self.assertIn("#define U0RXD_GPIO_NUM 12", text)
@@ -473,6 +483,13 @@ class AdapterSeamTests(unittest.TestCase):
         self.assertLessEqual(mixed["window_us_upper"],
                              5000 * mixed["samples"])
 
+    def test_util_pooled_count_bound_32(self) -> None:
+        # config range cca_attempts 1..32: the formatter must publish
+        # samples/attempted up to 32 and omit the whole util object above
+        # (truthful gap, never clamped).
+        out = _run(self.exe, "util-bounds").decode()
+        self.assertIn("util-bounds ok", out)
+
     def test_tx_task_frame_not_on_task_stack(self) -> None:
         # A 4103-byte MonitorTlvFrame local would exceed the 4096-byte TX
         # task stack (and nested wasting the app task's stack) before any
@@ -548,6 +565,15 @@ class SpectrumWireTests(unittest.TestCase):
     def test_capture_sentinel_validation(self) -> None:
         # OK, partial(range), first-word-only, overrun, NULL — see fixture
         self.assertEqual(self._run_mode("validate"), "0 2 2 3 1")
+
+    def test_bench_runs_and_reports(self) -> None:
+        # DSP benchmark (timing only, no thresholds): production path for
+        # both FFT sizes + the Hann cosf-vs-twiddle A/B, all parseable.
+        out = self._run_mode("bench")
+        self.assertIn("bench power_dbfs fft=64 frames=", out)
+        self.assertIn("bench power_dbfs fft=1024 frames=", out)
+        self.assertIn("bench hann cosf_ns=", out)
+        self.assertIn("twiddle_ns=", out)
 
     @staticmethod
     def _tone_words(n: int, k0: int, amp: int) -> np.ndarray:

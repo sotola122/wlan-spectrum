@@ -43,7 +43,14 @@ HDR = struct.Struct("<BH")
 CRC = struct.Struct("<I")
 SPEC_HDR = struct.Struct("<ffH")
 STATUS_BIN = struct.Struct("<BBIIb")
-CONFIG = struct.Struct("<BBHHI")
+CONFIG = struct.Struct("<BBHHIHB")
+# ONE CURRENT CONFIG v1 (settings-performance-scope item 2): mode u8,
+# band u8, sweep_ms u16, fft_size u16, sample_rate_khz u32,
+# channel_dwell_ms u16 (0=AUTO), cca_attempts u8 -> exactly 13 bytes
+CONFIG_DWELL_AUTO = 0
+CONFIG_ATTEMPTS_DEFAULT = 16
+CONFIG_ATTEMPTS_MIN, CONFIG_ATTEMPTS_MAX = 1, 32
+CONFIG_DWELL_EXPLICIT_MIN, CONFIG_DWELL_EXPLICIT_MAX = 120, 2000
 # epoch u32, cycle u32, band u8, channel u8, mode u8, rate_code u8,
 # fft_size u16, source u16, center_khz u32, span_khz u32  (24 bytes,
 # handoff v2 section 3; payload = 24 + 2 * fft_size)
@@ -151,8 +158,12 @@ def encode_status_bin(band: int, mode: int, sweep_count: int, uptime_ms: int, te
     return frame(T_STATUS, STATUS_BIN.pack(band, mode, sweep_count, uptime_ms, temp_c))
 
 
-def encode_config(mode: int, band: int, sweep_ms: int, fft_size: int, sample_rate_khz: int) -> bytes:
-    return frame(T_CONFIG, CONFIG.pack(mode, band, sweep_ms, fft_size, sample_rate_khz))
+def encode_config(mode: int, band: int, sweep_ms: int, fft_size: int,
+                  sample_rate_khz: int, channel_dwell_ms: int = 0,
+                  cca_attempts: int = 16) -> bytes:
+    return frame(T_CONFIG, CONFIG.pack(mode, band, sweep_ms, fft_size,
+                                       sample_rate_khz, channel_dwell_ms,
+                                       cca_attempts))
 
 
 # ---------------------------------------------------------------- decode
@@ -257,8 +268,11 @@ def decode(t: int, payload: bytes):
                           source, center_khz, span_khz,
                           bins.astype(np.float32) / 100.0)
     if t == T_CONFIG:
-        mode, band, sweep_ms, fft, sr = CONFIG.unpack(payload)
-        return {"mode": mode, "band": band, "sweep_ms": sweep_ms, "fft_size": fft, "sample_rate_khz": sr}
+        mode, band, sweep_ms, fft, sr, dwell, attempts = CONFIG.unpack(
+            payload)
+        return {"mode": mode, "band": band, "sweep_ms": sweep_ms,
+                "fft_size": fft, "sample_rate_khz": sr,
+                "channel_dwell_ms": dwell, "cca_attempts": attempts}
     raise ValueError(f"unknown type 0x{t:02x}")
 
 

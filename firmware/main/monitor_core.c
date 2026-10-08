@@ -32,9 +32,16 @@ static bool has_valid_values(const MonitorConfig *config) {
                   config->fft_size == 1024;
     bool rate_ok = config->sample_rate_khz == 20000 ||
                    config->sample_rate_khz == 40000;
+    bool dwell_ok = config->channel_dwell_ms == 0 ||
+                    (config->channel_dwell_ms >=
+                         MONITOR_CHANNEL_DWELL_EXPLICIT_MIN_MS &&
+                     config->channel_dwell_ms <=
+                         MONITOR_CHANNEL_DWELL_EXPLICIT_MAX_MS);
+    bool attempts_ok = config->cca_attempts >= MONITOR_CCA_ATTEMPTS_MIN &&
+                       config->cca_attempts <= MONITOR_CCA_ATTEMPTS_MAX;
     return config->mode <= 1 && config->band <= 1 &&
            config->sweep_ms >= 100 && config->sweep_ms <= 10000 &&
-           fft_ok && rate_ok;
+           fft_ok && rate_ok && dwell_ok && attempts_ok;
 }
 
 bool monitor_config_is_valid(const MonitorConfig *config) {
@@ -50,7 +57,9 @@ bool monitor_config_equal(const MonitorConfig *a, const MonitorConfig *b) {
     }
     return a->mode == b->mode && a->band == b->band &&
            a->sweep_ms == b->sweep_ms && a->fft_size == b->fft_size &&
-           a->sample_rate_khz == b->sample_rate_khz;
+           a->sample_rate_khz == b->sample_rate_khz &&
+           a->channel_dwell_ms == b->channel_dwell_ms &&
+           a->cca_attempts == b->cca_attempts;
 }
 
 void monitor_config_parser_init(MonitorConfigParser *parser) {
@@ -117,6 +126,9 @@ bool monitor_config_feed(MonitorConfigParser *parser, uint8_t byte,
             .sweep_ms = read_le16(parser->frame_bytes + 5),
             .fft_size = read_le16(parser->frame_bytes + 7),
             .sample_rate_khz = read_le32(parser->frame_bytes + 9),
+            /* appended: payload offsets 10 (u16) and 12 (u8) */
+            .channel_dwell_ms = read_le16(parser->frame_bytes + 13),
+            .cca_attempts = parser->frame_bytes[15],
         };
         if (has_valid_values(&next)) {
             *out_config = next;
@@ -127,13 +139,20 @@ bool monitor_config_feed(MonitorConfigParser *parser, uint8_t byte,
     }
 }
 
-uint32_t monitor_dwell_ms(uint16_t sweep_ms, size_t channel_count) {
-    if (channel_count == 0) {
+uint32_t monitor_dwell_ms(const MonitorConfig *config, size_t channel_count) {
+    if (config == NULL || channel_count == 0) {
         return 0;
     }
-    uint32_t per_channel = ((uint32_t)sweep_ms + (uint32_t)channel_count - 1u) /
-                           (uint32_t)channel_count;
-    return per_channel < MONITOR_MIN_DWELL_MS ? MONITOR_MIN_DWELL_MS : per_channel;
+    uint32_t base;
+    if (config->channel_dwell_ms != 0) {
+        base = config->channel_dwell_ms;        /* explicit override */
+    } else {
+        base = ((uint32_t)config->sweep_ms + (uint32_t)channel_count - 1u) /
+               (uint32_t)channel_count;        /* ceil(sweep / channels) */
+    }
+    uint32_t dwell = base < MONITOR_MIN_DWELL_MS ? MONITOR_MIN_DWELL_MS : base;
+    uint32_t cca_budget_ms = 5u * (uint32_t)config->cca_attempts;
+    return cca_budget_ms > dwell ? cca_budget_ms : dwell;
 }
 
 /* JP conservative receive allowlist. Channel 14 excluded (NO-OFDM needs a
@@ -513,6 +532,12 @@ size_t monitor_format_config_event(char *dst, size_t capacity_bytes,
     ok = ok && json_add_number(root, "fft_size", event->config.fft_size);
     ok = ok && json_add_number(root, "sample_rate_khz",
                                event->config.sample_rate_khz);
+    /* ONE v1 CONFIG: echo BOTH requested new fields, then the effective
+     * dwell (ack/retry comparison uses all seven requested fields). */
+    ok = ok && json_add_number(root, "channel_dwell_ms",
+                               event->config.channel_dwell_ms);
+    ok = ok && json_add_number(root, "cca_attempts",
+                               event->config.cca_attempts);
     ok = ok && json_add_number(root, "dwell_ms", event->dwell_ms);
     cJSON *channels = NULL;
     ok = ok && json_add_array(root, "channels", &channels);
@@ -568,8 +593,9 @@ size_t monitor_format_config_event(char *dst, size_t capacity_bytes,
             ok = ok && json_add_string(util, "label",
                                        "sampled PHY CCA (experimental); "
                                        "NAV equivalence not established; "
-                                       "pooled sum of up to 8 sampled "
-                                       "short windows, not the dwell span");
+                                       "pooled sum of up to cca_attempts "
+                                       "(1..32, default 16) sampled short "
+                                       "windows, not the dwell span");
         } else {
             ok = ok && json_add_string(util, "blocker",
                                        "cca_semantics_unproven");
@@ -636,16 +662,17 @@ size_t monitor_format_channel_event(char *dst, size_t capacity_bytes,
     ok = ok && json_add_number(root, "ap_dropped",
                                obs->access_points_dropped);
     /* CCA utilization (CURRENT pooled contract, no version key): sum of
-     * up to EIGHT distributed one-shot windows per valid dwell, each
-     * window strictly validated by the firmware. Absence of the object is
-     * the truthful gap (zero valid windows publish nothing). Host computes
-     * 100*busy/total over the pooled sums; window_us_upper is the SUM of
-     * the sampled short windows, never the dwell span. samples = valid
-     * windows (1..8), attempted = windows actually tried (samples..8). */
+     * up to cca_attempts (1..32, default 16) distributed one-shot windows
+     * per valid dwell, each window strictly validated by the firmware.
+     * Absence of the object is the truthful gap (zero valid windows
+     * publish nothing). Host computes 100*busy/total over the pooled sums;
+     * window_us_upper is the SUM of the sampled short windows, never the
+     * dwell span. samples = valid windows (1..32), attempted = windows
+     * actually tried (samples..32); 32 x 0x07ffffff fits uint32. */
     if (ok && obs->util_valid &&
-        obs->util_samples >= 1 && obs->util_samples <= 8 &&
+        obs->util_samples >= 1 && obs->util_samples <= 32 &&
         obs->util_attempted >= obs->util_samples &&
-        obs->util_attempted <= 8 &&
+        obs->util_attempted <= 32 &&
         obs->util_total >= obs->util_samples &&
         obs->util_total <= obs->util_samples * 0x07ffffffu &&
         obs->util_busy <= obs->util_total &&

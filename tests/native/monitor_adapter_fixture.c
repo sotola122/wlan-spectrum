@@ -14,6 +14,7 @@
 #include "monitor_radio.h"
 
 #include "fake_sdk.h"
+#include "esp_timer.h"
 #include "soc/uart_pins.h"
 
 #include <assert.h>
@@ -47,11 +48,14 @@ static void build_config_frame(uint8_t *out, uint8_t mode, uint8_t band,
     out[10] = (uint8_t)((rate_khz >> 8) & 0xffu);
     out[11] = (uint8_t)((rate_khz >> 16) & 0xffu);
     out[12] = (uint8_t)((rate_khz >> 24) & 0xffu);
+    out[13] = 0;      /* channel_dwell_ms = 0 (AUTO) */
+    out[14] = 0;
+    out[15] = MONITOR_CCA_ATTEMPTS_DEFAULT;
     uint32_t crc = monitor_crc32(out, MONITOR_CONFIG_FRAME_BYTES);
-    out[13] = (uint8_t)(crc & 0xffu);
-    out[14] = (uint8_t)((crc >> 8) & 0xffu);
-    out[15] = (uint8_t)((crc >> 16) & 0xffu);
-    out[16] = (uint8_t)((crc >> 24) & 0xffu);
+    out[16] = (uint8_t)(crc & 0xffu);
+    out[17] = (uint8_t)((crc >> 8) & 0xffu);
+    out[18] = (uint8_t)((crc >> 16) & 0xffu);
+    out[19] = (uint8_t)((crc >> 24) & 0xffu);
 }
 
 static size_t build_beacon(uint8_t *buf, const uint8_t bssid[6],
@@ -218,7 +222,9 @@ static void case_poll_budget(void) {
     MonitorConfig got;
     assert(monitor_link_take_config(&got));
     assert(got.mode == 1 && got.band == 1 && got.sweep_ms == 3000 &&
-           got.fft_size == 128 && got.sample_rate_khz == 40000);
+           got.fft_size == 128 && got.sample_rate_khz == 40000 &&
+           got.channel_dwell_ms == 0 &&
+           got.cca_attempts == MONITOR_CCA_ATTEMPTS_DEFAULT);
     assert(!monitor_link_take_config(&got));
     printf("poll-budget ok polls=%d consumed=%zu\n", polls, consumed);
 }
@@ -244,7 +250,7 @@ static void case_radio_sightings(void) {
     assert(monitor_radio_init() == ESP_OK);
     wifi_promiscuous_cb_t cb = fake_wifi_rx_cb();
     assert(cb != NULL);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);
     assert(fake_wifi_promiscuous_enabled());
     assert(fake_wifi_last_channel() == 6);
 
@@ -280,7 +286,7 @@ static void case_radio_sightings(void) {
 
 static void case_radio_gating(void) {
     assert(monitor_radio_init() == ESP_OK);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);
 
     uint8_t beacon[128];
     uint8_t bssid[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
@@ -304,7 +310,7 @@ static void case_radio_gating(void) {
     assert(obs.access_point_count == 1);      /* only the mgmt sighting */
 
     /* sighting-queue overflow increments ap_dropped, never reduces packets */
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);
     for (int i = 0; i < 40; i++) {
         fire_rx(WIFI_PKT_MGMT, -50, 0, 6, (uint16_t)n, beacon, n);
     }
@@ -332,7 +338,7 @@ static void case_radio_util(void) {
     fake_time_autostep(10u);
     fake_cca_step(80u, 0u);
     uint32_t calls0 = fake_cca_set_cnt_calls();
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);
     assert(fake_cca_set_cnt_calls() == calls0 + 1u);
     assert(fake_cca_set_cnt_value() == 0x400u);
     assert(fake_cca_set_cnt_arm() == 1u);
@@ -363,7 +369,7 @@ static void case_radio_util(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_time_autostep(10u);
     fake_cca_step(80u, 240u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);
     monitor_radio_finish(&out);
     fake_time_autostep(0u);
     fake_cca_step(0u, 0u);
@@ -377,7 +383,7 @@ static void case_radio_util(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_time_autostep(10u);
     fake_cca_step(1u, 0u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);
     monitor_radio_finish(&out);
     fake_time_autostep(0u);
     fake_cca_step(0u, 0u);
@@ -388,7 +394,7 @@ static void case_radio_util(void) {
     fake_cca_set(2000u, 0u, 0u);
     fake_time_autostep(10u);
     fake_cca_step(80u, 0u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);
     monitor_radio_finish(&out);
     fake_time_autostep(0u);
     fake_cca_step(0u, 0u);
@@ -399,7 +405,7 @@ static void case_radio_util(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_time_autostep(10u);
     fake_cca_step(80u, 40u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);
     monitor_radio_finish(&out);
     fake_time_autostep(0u);
     fake_cca_step(0u, 0u);
@@ -413,7 +419,7 @@ static void case_radio_util(void) {
     /* 8. failed begin: no arm at all */
     uint32_t c0 = fake_cca_set_cnt_calls();
     fake_wifi_set_channel_result(ESP_ERR_INVALID_STATE);
-    assert(monitor_radio_begin(0, 6) == ESP_ERR_INVALID_STATE);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_ERR_INVALID_STATE);
     fake_wifi_set_channel_result(ESP_OK);
     assert(fake_cca_set_cnt_calls() == c0);
 
@@ -423,7 +429,7 @@ static void case_radio_util(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_time_autostep(0u);                /* clock frozen */
     fake_cca_step(0u, 0u);                 /* counter never advances */
-    assert(monitor_radio_begin(0, 6) == ESP_OK);   /* returns, no hang */
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);   /* returns, no hang */
     monitor_radio_finish(&out);
     assert(!out.util_valid);
 
@@ -434,10 +440,10 @@ static void case_radio_util(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_time_autostep(10u);
     fake_cca_step(80u, 0u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);   /* window armed */
+    assert(monitor_radio_begin(0, 6, 16) == ESP_OK);   /* window armed */
     uint32_t c1 = fake_cca_set_cnt_calls();
     fake_wifi_set_channel_result(ESP_ERR_INVALID_STATE);
-    assert(monitor_radio_begin(0, 6) == ESP_ERR_INVALID_STATE);
+    assert(monitor_radio_begin(0, 6, 16) == ESP_ERR_INVALID_STATE);
     fake_wifi_set_channel_result(ESP_OK);
     assert(fake_cca_set_cnt_calls() == c1);        /* failed begin: no arm */
     fake_time_autostep(0u);
@@ -463,13 +469,20 @@ static void case_radio_util_pooled(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_cca_step(80u, 40u);
     fake_time_autostep(10u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 8) == ESP_OK);
+    int64_t t_begin = esp_timer_get_time();
     const uint32_t expect_after_tick[12] =
-        {1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 8};
+        {1, 2, 3, 3, 4, 5, 5, 6, 7, 8, 8, 8};
     for (int k = 0; k < 12; k++) {
         fake_time_advance_us(10000);   /* the app's dwell-wait tick */
         monitor_radio_cca_tick(120);
-        assert(fake_cca_set_cnt_calls() == expect_after_tick[k]);
+        uint32_t got = fake_cca_set_cnt_calls();
+        if (got != expect_after_tick[k]) {
+            fprintf(stderr, "tick %d: attempts=%u want=%u elapsed=%lld\n",
+                    k, got, expect_after_tick[k],
+                    (long long)(esp_timer_get_time() - t_begin));
+            assert(got == expect_after_tick[k]);
+        }
     }
     fake_time_autostep(0u);
     fake_cca_step(0u, 0u);
@@ -500,7 +513,7 @@ static void case_radio_util_pooled(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_cca_step(80u, 40u);         /* window A: busy = 13 x 40 = 520 */
     fake_time_autostep(10u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 8) == ESP_OK);
     fake_cca_step(80u, 60u);         /* window B: busy = 13 x 60 = 780 */
     fake_time_advance_us(10000);
     fake_time_advance_us(10000);     /* ~20 ms: slot1 due */
@@ -520,7 +533,7 @@ static void case_radio_util_pooled(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_cca_step(80u, 40u);
     fake_time_autostep(10u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);   /* slot0 = attempt 1 */
+    assert(monitor_radio_begin(0, 6, 8) == ESP_OK);   /* slot0 = attempt 1 */
     fake_time_autostep(0u);            /* freeze; control elapsed exactly */
     fake_time_advance_us(117000u);     /* elapsed 117 ms, remaining 3 ms */
     uint32_t arms = fake_cca_set_cnt_calls();
@@ -536,9 +549,9 @@ static void case_radio_util_pooled(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_time_autostep(10u);
     fake_cca_step(80u, 40u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 8) == ESP_OK);
     fake_wifi_set_channel_result(ESP_ERR_INVALID_STATE);
-    assert(monitor_radio_begin(0, 6) == ESP_ERR_INVALID_STATE);
+    assert(monitor_radio_begin(0, 6, 8) == ESP_ERR_INVALID_STATE);
     fake_wifi_set_channel_result(ESP_OK);
     fake_time_autostep(0u);
     fake_cca_step(0u, 0u);
@@ -552,7 +565,7 @@ static void case_radio_util_pooled(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_cca_step(80u, 40u);
     fake_time_autostep(10u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);
+    assert(monitor_radio_begin(0, 6, 8) == ESP_OK);
     monitor_radio_finish(&out);
     assert(out.util_valid && out.util_attempted == 1);
     MonitorObservation again;
@@ -572,7 +585,7 @@ static void case_radio_util_pooled(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_cca_step(80u, 40u);
     fake_time_autostep(10u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);      /* w1: valid */
+    assert(monitor_radio_begin(0, 6, 8) == ESP_OK);      /* w1: valid */
     fake_time_advance_us(10000);
     monitor_radio_cca_tick(120);      /* ~10 ms: slot0 consumed, skip */
     fake_cca_step(80u, 200u);      /* w2: busy=13x200=2600 > total=1024 */
@@ -603,7 +616,7 @@ static void case_radio_util_pooled(void) {
     fake_cca_set(0u, 0u, 0u);
     fake_cca_step(80u, 40u);
     fake_time_autostep(10u);
-    assert(monitor_radio_begin(0, 6) == ESP_OK);      /* slot 0: 1 arm */
+    assert(monitor_radio_begin(0, 6, 8) == ESP_OK);      /* slot 0: 1 arm */
     arms = fake_cca_set_cnt_calls();
     fake_time_advance_us(70000);      /* jump ~4 slots at once */
     monitor_radio_cca_tick(120);
@@ -617,7 +630,99 @@ static void case_radio_util_pooled(void) {
     fake_cca_step(0u, 0u);
     monitor_radio_finish(&out);
 
+    /* 9. COUNT MATRIX from config: attempts {1, 8, 16, 32} each schedule
+     * EXACTLY that many valid windows over the effective dwell (5 ms per
+     * attempt floor -> 120/120/120/160 ms), at 1 ms tick cadence like the
+     * app deadline loop. Every window valid (constant trace). */
+    {
+        static const uint8_t counts[] = {1, 8, 16, 32};
+        for (size_t ci = 0; ci < sizeof(counts); ci++) {
+            uint8_t n = counts[ci];
+            uint32_t dwell = 5u * n > 120u ? 5u * n : 120u;
+            fake_cca_arm_reset(true);
+            fake_cca_ctrl_set(0x80000400u);
+            fake_cca_set(0u, 0u, 0u);
+            fake_cca_step(80u, 40u);
+            fake_time_autostep(10u);
+            assert(monitor_radio_begin(0, 6, n) == ESP_OK);
+            for (uint32_t ms = 0; ms < dwell; ms++) {
+                fake_time_advance_us(1000);
+                monitor_radio_cca_tick(dwell);
+            }
+            fake_time_autostep(0u);
+            fake_cca_step(0u, 0u);
+            monitor_radio_finish(&out);
+            if (!out.util_valid || out.util_samples != n ||
+                out.util_attempted != n ||
+                out.util_total != (uint32_t)n * 0x400u ||
+                out.util_busy != (uint32_t)n * 520u) {
+                fprintf(stderr,
+                        "count %u: valid=%d samples=%u attempted=%u "
+                        "total=%lu busy=%lu\n",
+                        n, (int)out.util_valid, out.util_samples,
+                        out.util_attempted, (unsigned long)out.util_total,
+                        (unsigned long)out.util_busy);
+                assert(0 && "count matrix");
+            }
+        }
+    }
+
+    /* 11. EXACT tail boundary: elapsed == dwell - 5000 passes the
+     * remaining-budget guard (5000 < 5000 is false) and computes
+     * slot == attempt_count — out of [0, count). The scheduler must SKIP
+     * it, not schedule an invented slot. Arithmetic: begin consumes
+     * exactly 170 us of fake time (start read + 16-window attempt), so
+     * advancing 114830 us lands the tick's own time read on 115000 us.
+     * Delayed context: slots 1..7 were all missed by this jump. */
+    fake_cca_arm_reset(true);
+    fake_cca_ctrl_set(0x80000400u);
+    fake_cca_set(0u, 0u, 0u);
+    fake_cca_step(80u, 40u);
+    fake_time_autostep(10u);
+    assert(monitor_radio_begin(0, 6, 8) == ESP_OK);   /* slot0 = attempt 1 */
+    arms = fake_cca_set_cnt_calls();
+    fake_time_advance_us(114830u);     /* tick read lands on 115000 us */
+    monitor_radio_cca_tick(120);
+    if (fake_cca_set_cnt_calls() != arms) {
+        fprintf(stderr, "tail boundary: attempts=%u want=%u (out-of-range "
+                "slot scheduled)\n", fake_cca_set_cnt_calls(), arms);
+        assert(0 && "tail boundary must skip");
+    }
+    fake_time_advance_us(1000);        /* past the boundary: budget guard */
+    monitor_radio_cca_tick(120);
+    assert(fake_cca_set_cnt_calls() == arms);
+    fake_time_autostep(0u);
+    fake_cca_step(0u, 0u);
+    monitor_radio_finish(&out);
+    assert(out.util_valid);
+    assert(out.util_attempted == 1 && out.util_samples == 1);
+
     printf("radio-util-pooled ok\n");
+}
+
+/* Formatter count bound: pooled samples/attempted span 1..32 (the config
+ * cca_attempts range); 33+ omits the whole util object (truthful gap). */
+static void case_util_bounds(void) {
+    MonitorObservation obs;
+    memset(&obs, 0, sizeof obs);
+    MonitorChannelEvent ev = {.epoch = 1, .cycle = 1, .observation = &obs};
+    char json[4096];
+    obs.util_valid = true;
+    obs.util_total = 40000;
+    obs.util_busy = 100;
+    obs.util_window_us_upper = 1000;
+    obs.util_samples = 32;             /* configuration maximum */
+    obs.util_attempted = 32;
+    size_t n = monitor_format_channel_event(json, sizeof json, &ev);
+    assert(n > 0);
+    assert(strstr(json, "\"samples\":32") != NULL);
+    assert(strstr(json, "\"attempted\":32") != NULL);
+    obs.util_samples = 33;             /* beyond range: gap, not clamp */
+    obs.util_attempted = 33;
+    n = monitor_format_channel_event(json, sizeof json, &ev);
+    assert(n > 0);
+    assert(strstr(json, "\"util\"") == NULL);
+    printf("util-bounds ok\n");
 }
 
 int main(int argc, char **argv) {
@@ -663,6 +768,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "radio-util-pooled") == 0) {
         case_radio_util_pooled();
+        return 0;
+    }
+    if (strcmp(argv[1], "util-bounds") == 0) {
+        case_util_bounds();
         return 0;
     }
     fprintf(stderr, "unknown case: %s\n", argv[1]);

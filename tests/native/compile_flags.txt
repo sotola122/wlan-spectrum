@@ -1,0 +1,4 @@
+-std=c11
+-I../../firmware/main
+-I../../firmware/managed_components/espressif__cjson/cJSON
+-Ifake_sdk

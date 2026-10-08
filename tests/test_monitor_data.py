@@ -18,7 +18,8 @@ from wifi_spectrum.monitor_data import (
 )
 
 CFG = {"mode": 0, "band": 0, "sweep_ms": 1000, "fft_size": 64,
-       "sample_rate_khz": 20000}
+       "sample_rate_khz": 20000, "channel_dwell_ms": 0,
+       "cca_attempts": 16}
 
 
 def config_event(epoch: int = 1, **over) -> dict:
@@ -744,8 +745,8 @@ class UtilContractTests(unittest.TestCase):
             self.pooled(samples=9),
             self.pooled(samples=True),
             self.pooled(attempted=2),           # attempted < samples(3)
-            self.pooled(attempted=9),
             self.pooled(attempted=True),
+            self.pooled(attempted=33),          # beyond 32 attempts
             self.pooled(busy=True),
             self.pooled(busy=40001),            # busy > total(40000)
             self.pooled(busy=-1),
@@ -913,6 +914,112 @@ class UtilContractTests(unittest.TestCase):
         self.assertTrue(self.state.accept(cycle_event(cycle=3)))
         self.assertEqual(list(self.state.util_samples), [6])
         self.assertEqual(self.state.util_samples[6]["busy"], 50)
+
+
+class LiveRetentionAndConfig7Tests(unittest.TestCase):
+    """settings-performance-scope item 1/2: Live retains each channel's
+    last measurement until replacement / known-missing / closed-cycle
+    expiry (a new cycle never wholesale-clears - parent repro), and the
+    ONE CURRENT CONFIG carries all seven fields."""
+
+    def setUp(self) -> None:
+        self.state = MonitorState()
+        self.state.request(0, 0, 1000, 64, 20000, 0, 16)
+
+    @staticmethod
+    def cap() -> dict:
+        return {"available": True, "source": UTIL_SOURCE,
+                "confidence": UTIL_CONFIDENCE}
+
+    @staticmethod
+    def util(busy: int = 100) -> dict:
+        return {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+                "busy": busy, "total": 1000, "samples": 4,
+                "attempted": 4, "window_us_upper": 819}
+
+    def ack(self) -> None:
+        self.state.accept(config_event(utilization=self.cap()))
+
+    def feed(self, chs, cycle: int, busy: int = 100) -> None:
+        for ch in chs:
+            self.state.accept(channel_event(cycle=cycle, ch=ch,
+                                            util=self.util(busy)))
+        self.state.accept(cycle_event(cycle=cycle))
+
+    def test_new_cycle_never_wholesale_clears(self) -> None:
+        self.ack()
+        self.feed(range(1, 14), 1)
+        self.assertEqual(len(self.state.util_samples), 13)
+        # parent repro: the first channel of cycle 2 must NOT wipe the rest
+        self.state.accept(channel_event(cycle=2, ch=1, util=self.util(0)))
+        self.assertEqual(len(self.state.util_samples), 13)
+        self.assertEqual(self.state.util_samples[1]["busy"], 0)
+        self.assertEqual(self.state.util_samples[13]["busy"], 100)
+
+    def test_marker_expires_only_uncovered_channels(self) -> None:
+        self.ack()
+        self.feed(range(1, 14), 1)
+        self.feed([1, 2], 2, busy=0)
+        # cycle 2 closed covering only ch1/ch2: the rest are truly missing
+        self.assertEqual(sorted(self.state.util_samples), [1, 2])
+        self.assertEqual(self.state.util_samples[1]["busy"], 0)
+
+    def test_channel_error_expires_entry_and_history(self) -> None:
+        self.ack()
+        self.feed([6], 1)
+        self.assertEqual(len(self.state.util_history.get(6, [])), 1)
+        self.state.accept({"schema": "wifi-monitor/1",
+                           "event": "channel_error", "epoch": 1,
+                           "band": 0, "cycle": 2, "ch": 6,
+                           "code": "timeout"})
+        self.assertNotIn(6, self.state.util_samples)
+        self.assertFalse(self.state.util_history.get(6))
+
+    def test_history_counts_one_entry_per_cycle(self) -> None:
+        self.ack()
+        self.feed([6], 1)
+        self.state.accept(channel_event(cycle=1, ch=6, util=self.util(200)))
+        self.assertEqual(len(self.state.util_history[6]), 1)  # dedupe
+        self.feed([6], 2, busy=0)
+        self.assertEqual(len(self.state.util_history[6]), 2)
+        # capability loss clears published AND history
+        self.state.accept(config_event(
+            utilization={"available": False, "blocker": "x"}))
+        self.assertFalse(self.state.util_history.get(6))
+
+    def test_config_ack_must_echo_all_seven_fields(self) -> None:
+        st = MonitorState()
+        st.request(0, 0, 1000, 64, 20000, 300, 7)
+        self.assertTrue(st.accept(
+            config_event(channel_dwell_ms=300, cca_attempts=7)))
+        self.assertTrue(st.ready)
+        missing = config_event(channel_dwell_ms=300, cca_attempts=7)
+        missing.pop("cca_attempts")
+        st2 = MonitorState()
+        st2.request(0, 0, 1000, 64, 20000, 300, 7)
+        self.assertFalse(st2.accept(missing))
+        st3 = MonitorState()
+        st3.request(0, 0, 1000, 64, 20000, 300, 7)
+        self.assertFalse(st3.accept(
+            config_event(channel_dwell_ms=300, cca_attempts=16)))
+
+    def test_attempt_bounds_scale_to_32(self) -> None:
+        self.assertIsNotNone(parse_channel_util(
+            {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+             "busy": 32, "total": 32 * 0x07FFFFFF, "samples": 32,
+             "attempted": 32, "window_us_upper": 5000 * 32}))
+        self.assertIsNotNone(parse_channel_util(
+            {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+             "busy": 9, "total": 1000, "samples": 9, "attempted": 9,
+             "window_us_upper": 819}))
+        self.assertIsNone(parse_channel_util(
+            {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+             "busy": 9, "total": 1000, "samples": 9, "attempted": 33,
+             "window_us_upper": 819}))
+        self.assertIsNone(parse_channel_util(
+            {"source": UTIL_SOURCE, "confidence": UTIL_CONFIDENCE,
+             "busy": 9, "total": 1000, "samples": 33, "attempted": 33,
+             "window_us_upper": 819}))
 
 
 if __name__ == "__main__":

@@ -41,7 +41,8 @@ from wifi_spectrum import tlv
 from wifi_spectrum.monitor_data import SCHEMA, decode_channel
 from wifi_spectrum.tlv import TlvParser
 
-CONFIG_FIELDS = ("mode", "band", "sweep_ms", "fft_size", "sample_rate_khz")
+CONFIG_FIELDS = ("mode", "band", "sweep_ms", "fft_size",
+                 "sample_rate_khz", "channel_dwell_ms", "cca_attempts")
 CASES: tuple[tuple[str, int, int], ...] = (
     ("live-2.4", 0, 0),
     ("sweep-2.4", 1, 0),
@@ -54,7 +55,7 @@ DEFAULT_RATE_KHZ = 20000
 SYNC_TIMEOUT_S = 10.0
 MIN_DWELL_MS = 120
 
-ConfigRequest = tuple[int, int, int, int, int]
+ConfigRequest = tuple[int, int, int, int, int, int, int]
 
 
 # ---------------------------------------------------------------- checker
@@ -189,6 +190,12 @@ def evaluate(request: ConfigRequest, events: list[tuple[float, object]], *,
                          f"{MIN_DWELL_MS} ms floor")
             else:
                 rep.dwell_ms = dwell
+                attempts = data.get("cca_attempts")
+                if type(attempts) is int and dwell < 5 * attempts:
+                    # effective dwell must cover the configured attempt
+                    # budget (item 2: max(120, ..., 5 * cca_attempts))
+                    rep.fail(f"dwell_ms {dwell} below the "
+                             f"5 * cca_attempts = {5 * attempts} budget")
             for flag in ("spectrum", "cca", "fft_supported"):
                 if data.get(flag) is not False:
                     rep.fail(f"config echo must declare {flag}: false")
@@ -294,12 +301,13 @@ def evaluate(request: ConfigRequest, events: list[tuple[float, object]], *,
 # ---------------------------------------------------------------- self-test
 def _cfg_bytes(request: ConfigRequest, epoch: int = 1,
                dwell: int = MIN_DWELL_MS) -> bytes:
-    mode, band, sweep, fft, rate = request
+    mode, band, sweep, fft, rate, channel_dwell_ms, cca_attempts = request
     return tlv.encode_status_json({
         "schema": SCHEMA, "event": "config", "fw": "wifi-monitor-0.1",
         "idf": "v6.0.3", "chip": "ESP32-C5", "country": "JP", "epoch": epoch,
         "mode": mode, "band": band, "sweep_ms": sweep, "fft_size": fft,
-        "sample_rate_khz": rate, "dwell_ms": dwell,
+        "sample_rate_khz": rate, "channel_dwell_ms": channel_dwell_ms,
+        "cca_attempts": cca_attempts, "dwell_ms": dwell,
         "channels": list(range(1, 14)), "spectrum": False, "cca": False,
         "fft_supported": False, "tx_dropped": 0,
     })
@@ -360,7 +368,7 @@ def self_test_fixtures() -> list[tuple[str, bytes, ConfigRequest, bool,
     request equals the device's already-active config (identical CONFIG
     re-ack: the device must NOT restart its running cycle). Streams are
     constructed in code - valid tests, not hardware captures."""
-    request: ConfigRequest = (0, 0, 1000, 64, 20000)
+    request: ConfigRequest = (0, 0, 1000, 64, 20000, 0, 16)
     return [
         ("good-two-cycles",
          _cfg_bytes(request) + _full_cycle(1) + _full_cycle(2),
@@ -458,11 +466,13 @@ def _run_bytes(name: str, request: ConfigRequest, blob: bytes,
 def corrupt_config_checks() -> list[str]:
     """Host-side wire vectors the smoke relies on when corrupting configs."""
     failures: list[str] = []
-    golden = bytes.fromhex("100a000101e8034000204e000095564e1d")
+    golden = bytes.fromhex(
+        "10 0d 00 01 01 e8 03 40 00 20 4e 00 00 00 00 10 2f 2a aa ff")
     parser = TlvParser()
     messages = parser.feed(golden)
     expected = [{"mode": 1, "band": 1, "sweep_ms": 1000, "fft_size": 64,
-                 "sample_rate_khz": 20000}]
+                 "sample_rate_khz": 20000, "channel_dwell_ms": 0,
+                 "cca_attempts": 16}]
     if messages != expected:
         failures.append(f"golden CONFIG decoded as {messages!r}")
     if tlv.crc32(b"123456789") != 0xCBF43926:
@@ -476,7 +486,7 @@ def corrupt_config_checks() -> list[str]:
     if parser.errors == 0:
         failures.append("corrupted CONFIG was not counted as an error")
     parser = TlvParser()
-    if parser.feed(golden[:13]):            # legacy CRC-less frame
+    if parser.feed(golden[:16]):           # legacy CRC-less frame
         failures.append("legacy CRC-less frame accepted")
     return failures
 
@@ -737,7 +747,7 @@ def _run_hardware(args: argparse.Namespace,
         if args.stream:
             name, mode, band = selected[0]
             request = (mode, band, DEFAULT_SWEEP_MS, DEFAULT_FFT,
-                       DEFAULT_RATE_KHZ)
+                       DEFAULT_RATE_KHZ, 0, 16)
             dev.clear_input()
             baseline = dev.parser.errors
             rx0 = dev.rx
@@ -755,7 +765,7 @@ def _run_hardware(args: argparse.Namespace,
         else:
             for name, mode, band in selected:
                 request = (mode, band, DEFAULT_SWEEP_MS, DEFAULT_FFT,
-                           DEFAULT_RATE_KHZ)
+                           DEFAULT_RATE_KHZ, 0, 16)
                 rep = run_case(dev, name, request, args.seconds,
                                prev_active=active)
                 reports.append(rep)
@@ -765,14 +775,15 @@ def _run_hardware(args: argparse.Namespace,
             if args.cases is None:
                 extra_window = min(args.seconds, 15.0)
                 dwell_req: ConfigRequest = (0, 0, 100, DEFAULT_FFT,
-                                            DEFAULT_RATE_KHZ)
+                                            DEFAULT_RATE_KHZ, 0, 16)
                 rep = run_case(dev, "dwell-100ms", dwell_req, extra_window,
                                min_cycles=1, prev_active=active)
                 reports.append(rep)
                 if rep.apply_ms is not None:
                     active = dwell_req
 
-                fft_req: ConfigRequest = (0, 0, DEFAULT_SWEEP_MS, 1024, 40000)
+                fft_req: ConfigRequest = (0, 0, DEFAULT_SWEEP_MS, 1024, 40000,
+                                          0, 16)
                 rep = run_case(dev, "fft-1024-rate-40000", fft_req,
                                extra_window, min_cycles=1,
                                prev_active=active)
@@ -801,7 +812,8 @@ def _run_hardware(args: argparse.Namespace,
                         extra_window))
 
                 split_req: ConfigRequest = (1, 0, DEFAULT_SWEEP_MS,
-                                            DEFAULT_FFT, DEFAULT_RATE_KHZ)
+                                            DEFAULT_FFT, DEFAULT_RATE_KHZ,
+                                            0, 16)
                 split_blob = tlv.encode_config(*split_req)
                 rep = run_case(dev, "split-config-bytewise", split_req,
                                extra_window, min_cycles=1,
@@ -813,9 +825,9 @@ def _run_hardware(args: argparse.Namespace,
                     active = split_req
 
                 oldest: ConfigRequest = (1, 1, DEFAULT_SWEEP_MS, DEFAULT_FFT,
-                                         DEFAULT_RATE_KHZ)
+                                         DEFAULT_RATE_KHZ, 0, 16)
                 newest: ConfigRequest = (0, 0, DEFAULT_SWEEP_MS, DEFAULT_FFT,
-                                         DEFAULT_RATE_KHZ)
+                                         DEFAULT_RATE_KHZ, 0, 16)
                 rep = run_case(dev, "concat-config-newest-wins", newest,
                                extra_window, min_cycles=1,
                                prev_active=active,

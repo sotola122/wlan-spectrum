@@ -27,9 +27,10 @@ static const uint16_t k_fft_sizes[] = {64, 128, 256, 512, 1024};
 #define CENTI_DB_FLOOR (-32768)
 
 /* Fixed-size static workspace (init-only allocation, documented in the
- * header). Single owner: the application task. The Hann window value is
- * computed inline per capture (no window table — statics are kept minimal
- * because the capture-bank linker assertion bounds DRAM growth). */
+ * header). Single owner: the application task. The Hann cosine reuses the
+ * existing twiddle table (cosine symmetry + stride MAX/N), so no window
+ * table exists — statics stay minimal because the capture-bank linker
+ * assertion bounds DRAM growth. */
 static bool g_spectrum_ready;
 static float g_twiddle_re[MONITOR_SPECTRUM_MAX_BINS / 2];
 static float g_twiddle_im[MONITOR_SPECTRUM_MAX_BINS / 2];
@@ -181,9 +182,18 @@ bool monitor_spectrum_power_dbfs(const uint32_t *iq_words, uint16_t fft_size,
     }
     float mean_i = sum_i / (float)fft_size;
     float mean_q = sum_q / (float)fft_size;
+    uint16_t hann_stride =
+        (uint16_t)(MONITOR_SPECTRUM_MAX_BINS / fft_size);
+    uint16_t twiddle_half = (uint16_t)(MONITOR_SPECTRUM_MAX_BINS / 2u);
     for (uint16_t n = 0; n < fft_size; n++) {
-        float w = 0.5f * (1.0f - cosf(2.0f * SPECTRUM_PI_F * (float)n /
-                                       (float)fft_size));
+        /* cos(2*pi*n/N) straight from the EXISTING twiddle table:
+         * j = n * (MAX/N) with cosine even symmetry above the half-table
+         * (cos(x+pi) = -cos(x)). Identical math, no per-capture cosf(),
+         * no extra static storage. */
+        uint16_t j = (uint16_t)(n * hann_stride);
+        float cosv = j < twiddle_half ? g_twiddle_re[j]
+                                      : -g_twiddle_re[j - twiddle_half];
+        float w = 0.5f * (1.0f - cosv);
         int32_t i_raw = sign_extend_10(iq_words[n]);
         int32_t q_raw = sign_extend_10(iq_words[n] >> 10);
         g_work[2u * n] = (((float)i_raw - mean_i) / IQ_FULL_SCALE) * w;

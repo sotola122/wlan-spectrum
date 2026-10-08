@@ -13,8 +13,13 @@ import zlib
 from wifi_spectrum import tlv
 from wifi_spectrum.tlv import Status, TlvParser, crc32, encode_config
 
-# Golden CONFIG: Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s + CRC 95 56 4e 1d
-CONFIG_GOLDEN = bytes.fromhex("100a000101e8034000204e000095564e1d")
+# Golden CONFIG v1 (13-byte payload <BBHHIHB>, parent struct+zlib golden):
+# Band Sweep, 5 GHz, 1000 ms, FFT 64, 20 MS/s, dwell AUTO, 16 CCA attempts
+CONFIG_GOLDEN = bytes.fromhex(
+    "10 0d 00 01 01 e8 03 40 00 20 4e 00 00 00 00 10 2f 2a aa ff")
+# live, 2.4 GHz: mode 0 band 0, same acquisition, default attempts
+CONFIG_GOLDEN_LIVE = bytes.fromhex(
+    "10 0d 00 00 00 e8 03 40 00 20 4e 00 00 00 00 10 c5 bf 99 b9")
 
 # Golden SPECTRUM_RF 0x04 (handoff v2 section 7, parent-verified):
 # epoch=1 cycle=0 band=0 ch=1 mode=0 rate_code=0 fft_size=8 source=0
@@ -44,12 +49,23 @@ class CrcKnownAnswerTests(unittest.TestCase):
         self.assertEqual(crc32(b"123456789"), zlib.crc32(b"123456789"))
 
     def test_config_frame_matches_published_golden_bytes(self) -> None:
-        frame = encode_config(1, 1, 1000, 64, 20000)
+        frame = encode_config(1, 1, 1000, 64, 20000, 0, 16)
         self.assertEqual(frame, CONFIG_GOLDEN)
-        # and the embedded checksum verifies against the first 13 bytes
-        body, wire = frame[:13], frame[13:]
-        self.assertEqual(wire, (0x1d4e5695).to_bytes(4, "little"))
-        self.assertEqual(crc32(body), 0x1D4E5695)
+        self.assertEqual(len(frame), 20)   # <BH> hdr3 + payload13 + CRC4
+        self.assertEqual(encode_config(0, 0, 1000, 64, 20000),
+                         CONFIG_GOLDEN_LIVE)   # dwell0 + attempts16
+        # and the embedded checksum verifies against header+payload
+        body, wire = frame[:16], frame[16:]
+        self.assertEqual(wire, (0xffaa2a2f).to_bytes(4, "little"))
+        self.assertEqual(crc32(body), 0xFFAA2A2F)
+
+    def test_config_decodes_all_seven_fields(self) -> None:
+        messages, errors = parse(CONFIG_GOLDEN)
+        self.assertEqual(errors, 0)
+        self.assertEqual(messages,
+                         [{"mode": 1, "band": 1, "sweep_ms": 1000,
+                           "fft_size": 64, "sample_rate_khz": 20000,
+                           "channel_dwell_ms": 0, "cca_attempts": 16}])
 
 
 class FrameRoundTripTests(unittest.TestCase):
@@ -131,7 +147,7 @@ class CorruptionAndResyncTests(unittest.TestCase):
         return good * reps
 
     def test_legacy_crc_less_frame_rejected_not_fallback(self) -> None:
-        legacy = CONFIG_GOLDEN[:13]      # no checksum bytes at all
+        legacy = CONFIG_GOLDEN[:16]     # no checksum bytes at all
         good = tlv.encode_status_json({"ok": True})
         # alone it must never decode (bounded wait, no false accept)
         messages, _ = parse(legacy)
@@ -230,7 +246,7 @@ class EarlyLengthRejectionTests(unittest.TestCase):
         self.assertGreater(errors, 0)
 
     def test_false_config_length_rejected_from_header(self) -> None:
-        # CONFIG payload is exactly CONFIG.size (10) bytes; any other
+        # CONFIG payload is exactly CONFIG.size (13) bytes; any other
         # advertised length is garbage from the header alone. Fixture
         # meanings are tool-computed below, not asserted from memory.
         for high in (0x05, 0x0F):

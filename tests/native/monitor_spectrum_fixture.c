@@ -13,9 +13,11 @@
 #include "monitor_spectrum.h"
 #include "monitor_capture.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Fake of the private SDK entry (librftest.a) so the adapter links on the
  * host. The native fixture never runs monitor_capture_snapshot's MCU path;
@@ -72,6 +74,84 @@ static int mode_validate(void) {
 
     printf("%d %d %d %d %d\n", (int)results[0], (int)results[1],
            (int)results[2], (int)results[3], (int)results[4]);
+    return 0;
+}
+
+/* bench: DSP measurement for the settings-performance scope (timing only,
+ * host-dependent, no pass/fail thresholds). Prints ns/frame for the
+ * production path (fft64/fft1024) and an in-process A/B of the Hann step
+ * (per-sample cosf vs twiddle-table lookup) on identical inputs. */
+static int mode_bench(void) {
+    static uint32_t iq64[64];
+    static uint32_t iq1024[1024];
+    static int16_t out_bins[1024];
+    for (uint16_t i = 0; i < 1024; i++) {
+        int32_t v = (int32_t)((uint32_t)(i * 37u) % 900u) - 450;
+        int32_t u = (int32_t)((uint32_t)(i * 91u) % 900u) - 450;
+        iq1024[i] = (uint32_t)(v & 0x3ff) | ((uint32_t)(u & 0x3ff) << 10);
+        if (i < 64) {
+            iq64[i] = iq1024[i];
+        }
+    }
+    if (!monitor_spectrum_init()) {
+        return 1;
+    }
+
+    const int reps64 = 50000;
+    const int reps1024 = 5000;
+    clock_t c0 = clock();
+    for (int r = 0; r < reps64; r++) {
+        if (!monitor_spectrum_power_dbfs(iq64, 64, out_bins)) {
+            return 1;
+        }
+    }
+    double ns64 = (double)(clock() - c0) * 1e9 / CLOCKS_PER_SEC / reps64;
+    c0 = clock();
+    for (int r = 0; r < reps1024; r++) {
+        if (!monitor_spectrum_power_dbfs(iq1024, 1024, out_bins)) {
+            return 1;
+        }
+    }
+    double ns1024 = (double)(clock() - c0) * 1e9 / CLOCKS_PER_SEC / reps1024;
+    printf("bench power_dbfs fft=64 frames=%d ns_per_frame=%.1f\n",
+           reps64, ns64);
+    printf("bench power_dbfs fft=1024 frames=%d ns_per_frame=%.1f\n",
+           reps1024, ns1024);
+
+    /* Hann step A/B, identical inputs: per-sample cosf (the previous
+     * product path) vs precomputed-table lookup (the current path). */
+    static float twiddle[512];
+    for (uint16_t j = 0; j < 512; j++) {
+        twiddle[j] = cosf(-2.0f * 3.14159265358979323846f * (float)j /
+                          1024.0f);
+    }
+    const int reps_win = 50000;
+    volatile float sink = 0.0f;
+    c0 = clock();
+    for (int r = 0; r < reps_win; r++) {
+        float acc = 0.0f;
+        for (uint16_t n = 0; n < 1024; n++) {
+            acc += 0.5f * (1.0f - cosf(2.0f * 3.14159265358979323846f *
+                                       (float)n / 1024.0f));
+        }
+        sink += acc;
+    }
+    double cosf_ns = (double)(clock() - c0) * 1e9 / CLOCKS_PER_SEC /
+                     (double)reps_win;
+    c0 = clock();
+    for (int r = 0; r < reps_win; r++) {
+        float acc = 0.0f;
+        for (uint16_t n = 0; n < 1024; n++) {
+            uint16_t j = n;                 /* stride MAX/N == 1 at N=1024 */
+            float cosv = j < 512 ? twiddle[j] : -twiddle[j - 512];
+            acc += 0.5f * (1.0f - cosv);
+        }
+        sink += acc;
+    }
+    double twiddle_ns = (double)(clock() - c0) * 1e9 / CLOCKS_PER_SEC /
+                        (double)reps_win;
+    printf("bench hann cosf_ns=%.2f twiddle_ns=%.2f sink=%.3f\n",
+           cosf_ns, twiddle_ns, (double)sink);
     return 0;
 }
 
@@ -191,6 +271,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "validate") == 0) {
         return mode_validate();
+    }
+    if (strcmp(argv[1], "bench") == 0) {
+        return mode_bench();
     }
     return 64;
 }

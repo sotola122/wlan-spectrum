@@ -80,7 +80,7 @@ Do not treat a dry run or a Linux container build as Windows verification.
 ## USB-UART programming
 
 On Linux, identify the board's USB-UART port under `/dev/serial/by-id/`.
-The Makefile's default `PORT` is the tested CP2102N bridge; override it for another board.
+There is no default device: pass `PORT` explicitly after identifying your board locally.
 Do not identify the MCU from the bridge's USB serial alone: esptool must report ESP32-C5 and the intended chip's MAC address before writing.
 The host user needs permission to open the serial port. Close the GUI and other serial consumers first.
 
@@ -98,13 +98,13 @@ After programming, open the same port at 921600 baud for the GUI or smoke test.
 ## Optional native JTAG identification and programming
 
 JTAG requires a separate connection to the board's native USB Serial/JTAG port; it is not available through the USB-UART bridge.
-The current Makefile's JTAG targets select native USB serial `<DEVICE_ID>`.
-Review that identifier before using the commands with another board.
+The Makefile's JTAG targets require `JTAG_SERIAL`, supplied locally for the intended board.
+Never commit a device serial, USB inventory or host registry export.
 The host user needs read/write access to the corresponding USB device node, in addition to permission to open its serial port.
 EIM activates SDK tools; it does not bypass Linux USB permissions.
 
 ```sh
-make jtag-probe
+make jtag-probe JTAG_SERIAL="$JTAG_SERIAL"
 ```
 
 A successful probe identifies the exact USB serial, an ESP32-C5 RISC-V core and its revision, then exits zero.
@@ -113,7 +113,7 @@ Do not proceed if the identifier or chip is different.
 
 ```sh
 make build
-make flash-jtag
+make flash-jtag JTAG_SERIAL="$JTAG_SERIAL"
 ```
 
 **Bring-up status:** JTAG identification has succeeded, but this JTAG programming sequence encountered reset/halt failures after writing the bootloader.
@@ -173,6 +173,74 @@ Only one process may own the COM port at a time. The [Windows wslc build](#build
 
 ## Hardware verification
 
+### Configurable dwell, CCA attempts and retained Live display
+
+The settings implementation was built with EIM and Podman on ESP-IDF v6.0.3.
+The EIM application image has SHA-256
+`4d3ba6ff08f00d9622295c6e45c312d3f78dc261cbf1ad8b5173d6fae2adc71c`;
+the Podman image has SHA-256
+`43c6c45c34be080fadd369cbb6f04fc329c2f3a3ce56a631321565059c96edf0`.
+Both builds succeeded. USB-UART programming and a separate flash readback
+matched the EIM application image. No NVS erase or eFuse operation was used.
+
+The combined suite passed 262 tests, including 38 native firmware tests.
+Host type checking, Ruff and the synthetic PTY GUI harness also passed.
+Regressions cover receive-start deadlines, CCA slot boundaries, the current
+13-byte CONFIG and seven-field acknowledgement, Live retention and missing
+markers, weighted visit aggregation, pending edits during old acknowledgements,
+and preserving the newest waterfall rows when history is resized.
+Grok 4.7 reviewed the firmware, host and privacy changes; its history-resize
+finding was repaired and re-reviewed before hardware acceptance.
+
+Three ten-second streaming/reconnect preflights passed. Four twelve-second
+RF smoke runs passed for Live and Sweep on both bands. The following separate
+raw captures exercised both bands, with at least two matching cycle markers
+per band in every row:
+
+| Mode | FFT size | CCA attempts | Requested dwell | RF frames | Valid utilization events |
+|---|---:|---:|---|---:|---:|
+| Live | 64 | 16 | Auto | 190 | 190 |
+| Live | 1024 | 16 | Auto | 179 | 180 |
+| Live | 64 | 1 | Auto | 191 | 188 |
+| Live | 64 | 8 | Auto | 190 | 190 |
+| Live | 64 | 32 | Auto | 168 | 168 |
+| Live | 64 | 16 | 300 ms | 117 | 117 |
+| Sweep | 64 | 16 | Auto | 189 | 189 |
+
+Independent replay verified all 1,224 captured RF frames and 1,222 valid
+utilization results against their raw TLV bytes, with zero parser errors.
+Frame and channel-event counts can differ at a capture's stopping boundary.
+The one-attempt run had three channel observations without a valid CCA result;
+these were missing measurements, not zero utilization. Other rows had valid
+CCA results for every captured channel observation, but not every attempted
+window was valid. For example, the 32-attempt run retained 26–32 valid windows.
+All rows reported zero firmware TX drops in the captured configuration events.
+
+Observed receive durations were 120–121 ms for the default 16-attempt runs,
+160–162 ms for 32 attempts with Auto dwell, and 300–301 ms for an explicit
+300 ms request. With default 16 attempts, measured cycle medians were
+1,654 / 2,552.5 ms at FFT64 and 2,040 / 3,147.5 ms at FFT1024
+(2.4 / 5 GHz). These are observations from these runs, not period guarantees
+or a controlled attribution of speed gains to one optimization.
+
+The physical-device Qt harness passed on Linux with offscreen rendering. It
+checked the shared RF/Demo view, explicit dwell 300 ms and seven CCA attempts,
+Apply and acknowledgement, display-only settings, same-event counter sums
+against bars/table/tooltips, Sweep publication, FFT/rate changes, pause/resume
+and disconnect/reconnect. Screenshots were inspected for actual RF traces,
+dBFS units, populated waterfall history and utilization. Local evidence is
+not published because captures can contain nearby AP identifiers.
+
+For the original Live regression's synthetic 112-event GUI input, the cumulative
+utilization-bar update time decreased from 0.984 s with retention alone to
+0.039 s with label reuse. This is a PC-side profile, not MCU throughput or RF
+accuracy. More CCA attempts add short observation windows; visit aggregation
+changes temporal averaging. Neither makes the measurement continuous or
+calibrated, nor guarantees that percentages stop changing.
+
+Windows remains a separate user-run check. The results below describe earlier
+images and are not additional runs of this settings image.
+
 ### Mean removal and multi-window CCA acceptance
 
 The snapshot-mean correction and distributed CCA implementation were built with EIM and Podman on ESP-IDF v6.0.3. The EIM application image programmed over CP2102N USB-UART and verified by esptool has SHA-256 `98135319a70359a573e787911214ffbd2bbc0af0413ce043b8e1956194d0f605`. Temporary raw-I/Q diagnostic telemetry is absent from this product image. Communication remains `wifi-monitor/1`, with no separate utilization-version field.
@@ -196,7 +264,7 @@ The physical-device GUI harness passed all 11 steps, including both bands, FFT/r
 
 One GUI session displayed a cumulative TLV discarded-byte count of 1576, unchanged between the inspected Live and 5 GHz screenshots. A rerun passed and its inspected Live screenshot showed zero, but the original count was not timestamped by phase. Its origin is therefore not established, and the clean raw-capture results must not be substituted for a claim of zero GUI-session errors. The protocol and receiver-pause limitations below still apply.
 
-The local evidence is under `.hermes/agent-sessions/pi/2026-10-07-spectrum-level/evidence/`: `product-flash.log`, `final-build-hashes.txt`, `parent-final-suite.log`, `pre-hil-smoke-*.log`, `postfix-run{4,5}-*`, `parent-postfix-raw-verification.json`, and `postfix-gui-harness*.log`. The paired-input basis for mean removal is recorded in the [center-frequency diagnosis](esp32c5-spectrum-research.md#center-frequency-offset-diagnosis). These results do not establish calibrated dBm or the physical origin of the receiver offset. The longer tests below belong to earlier images, not this revision.
+Raw captures, device logs and screenshots are retained privately, outside tracked source. The paired-input basis for mean removal is recorded in the [center-frequency diagnosis](esp32c5-spectrum-research.md#center-frequency-offset-diagnosis). These results do not establish calibrated dBm or the physical origin of the receiver offset. The longer tests below belong to earlier images, not this revision.
 
 ### RF and sampled-CCA acceptance
 
@@ -222,7 +290,7 @@ The final combined suite passed 226 tests, including 34 firmware/native test ent
 
 These results verify the implemented data path and display behavior. CCA remains an experimental sampled PHY interpretation, not a calibrated or whole-dwell airtime measurement; FFT power remains relative dBFS. The UART stall limitation described below still applies. Windows validation belongs to the separate Windows procedure, and JTAG breakpoint verification is not covered by this USB-UART acceptance.
 
-The local evidence is retained under `.hermes/agent-sessions/pi/2026-10-06-wifi-monitor/evidence/`: `cca-accept-gate-*.log`, `cca-accept-600s-band{0,1}.log`, `cca-accept-gui.log` and `cca-accept-gui-shots/`. Host logs and the frozen checker hashes are in the adjacent Python session's evidence directory. These session artifacts are intentionally Git-ignored.
+The raw acceptance logs, captures and screenshots are retained privately and excluded from Git.
 
 ### RF spectrum acceptance
 

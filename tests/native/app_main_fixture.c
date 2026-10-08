@@ -228,22 +228,43 @@ MonitorCaptureStatus monitor_capture_snapshot(uint16_t fft_size,
 static uint8_t g_radio_band;
 static uint8_t g_radio_channel;
 static bool g_radio_fail_begin;
+static uint8_t g_begin_attempts;    /* cca_attempts the app actually passed */
+static int64_t g_radio_start_us;    /* receive start (post-tune) */
+static int64_t g_first_dwell_span_us;  /* start -> finish of first dwell */
+
+/* Nonzero fake costs so the app seam test can prove the dwell deadline is
+ * based on RECEIVE start: tune is excluded, the first CCA window is
+ * inside. With a pre-tune basis these costs would shorten the dwell. */
+#define FAKE_TUNE_COST_US 5000
+#define FAKE_FIRST_WINDOW_US 800
 
 esp_err_t monitor_radio_init(void) {
     return ESP_OK;
 }
 
-esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel) {
+esp_err_t monitor_radio_begin(uint8_t band, uint8_t channel,
+                              uint8_t cca_attempts) {
     if (g_radio_fail_begin) {
         return ESP_ERR_INVALID_STATE;
     }
+    g_time_us += FAKE_TUNE_COST_US;       /* retune: must NOT count */
+    g_radio_start_us = g_time_us;         /* receive starts here */
+    g_time_us += FAKE_FIRST_WINDOW_US;    /* slot0 CCA window: counts */
     g_radio_band = band;
     g_radio_channel = channel;
+    g_begin_attempts = cca_attempts;
     radio_evt('B');
     return ESP_OK;
 }
 
+int64_t monitor_radio_receive_start_us(void) {
+    return g_radio_start_us;
+}
+
 void monitor_radio_finish(MonitorObservation *out) {
+    if (g_first_dwell_span_us == 0) {
+        g_first_dwell_span_us = g_time_us - g_radio_start_us;
+    }
     radio_evt('F');
     memset(out, 0, sizeof(*out));
     out->band = g_radio_band;
@@ -273,9 +294,9 @@ int64_t esp_timer_get_time(void) {
 void vTaskDelay(TickType_t ticks) {
     g_time_us += (int64_t)ticks * 1000;
     g_delay_count++;
-    if (g_site == 3 && g_delay_count >= 14) {
-        /* 10 ms dwell steps: ch1 dwell = 12 delays, channel_error fires at
-         * the ch1 boundary, ch2 adds 2 more delays -> stop there. */
+    if (g_site == 3 && g_delay_count >= 121) {
+        /* 1 ms deadline steps: ch1 dwell = 120 delays, channel_error fires
+         * at the ch1 boundary, ch2's first delay -> stop there. */
         g_escape_reason = 3;            /* scenario 3: enough dwells seen */
         longjmp(g_escape, 3);
     }
@@ -316,6 +337,8 @@ static void inject_pending_config(void) {
     g_mailbox_config.sweep_ms = 3000;
     g_mailbox_config.fft_size = 128;
     g_mailbox_config.sample_rate_khz = 40000;
+    g_mailbox_config.channel_dwell_ms = 0;   /* AUTO: 3000/20 -> 150 ms */
+    g_mailbox_config.cca_attempts = 16;
     g_mailbox_valid = true;
     g_inject_at_delay = -1;             /* one-shot */
 }
@@ -393,15 +416,34 @@ int main(int argc, char **argv) {
                g_site, g_record_count, g_delay_count);
         if (g_site == 1) {
             /* Scheduling seam: ticks only inside an open dwell; block 1 =
-             * initial sweep (dwell 120 ms -> 12 ticks), block 2 = epoch-2
-             * injected sweep 3000 ms/20 ch (dwell 150 ms -> 15 ticks). */
-            static const int expect[2] = {12, 15};
+             * initial sweep (dwell 120 ms -> 120 x 1 ms deadline ticks),
+             * block 2 = epoch-2 injected sweep 3000 ms/20 ch (dwell 150 ms
+             * -> 150 ticks); the app passed the default 16 attempts. */
+            static const int expect[2] = {120, 150};
             if (g_radio_evt[0] != 'B' || !radio_sequence_ok(expect, 2)) {
                 fprintf(stderr, "site1: FAIL: radio sequence (%.80s)\n",
                         g_radio_evt);
                 return 1;
             }
-            printf("site1 dwell-tick-schedule ok (%.64s)\n", g_radio_evt);
+            if (g_begin_attempts != 16) {
+                fprintf(stderr, "site1: FAIL: cca_attempts=%u (want 16)\n",
+                        g_begin_attempts);
+                return 1;
+            }
+            /* Receive-start deadline basis: first dwell (120 ms) lasts
+             * [120000, 122000) us from RECEIVE start — retune (5 ms) must
+             * be excluded, the first CCA window (0.8 ms) must be inside.
+             * A pre-tune basis yields ~115800 us here. */
+            if (g_first_dwell_span_us < 120000 ||
+                g_first_dwell_span_us > 122000) {
+                fprintf(stderr, "site1: FAIL: receive span %lld us "
+                        "(want 120000..122000)\n",
+                        (long long)g_first_dwell_span_us);
+                return 1;
+            }
+            printf("site1 receive-basis ok (span=%lld)\n",
+                   (long long)g_first_dwell_span_us);
+            printf("site1 dwell-tick-schedule ok (%.32s...)\n", g_radio_evt);
         } else {
             /* Backoff: begin never succeeds -> no dwell, no CCA ticks. */
             if (strchr(g_radio_evt, 'B') != NULL ||

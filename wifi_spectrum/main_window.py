@@ -169,10 +169,27 @@ class PlotCard(QFrame):
 
 # ------------------------------------------------------------------ window
 class MainWindow(QMainWindow):
-    def __init__(self, start_demo: bool = False) -> None:
+    # non-sensitive persisted settings (item 5): plain keys only - never
+    # port/USB/auto-connect/credentials. None = no persistence (ordinary
+    # fixtures stay deterministic and never touch a user store).
+    SETTINGS_DEFAULTS = {"fps": 30, "history_rows": 200,
+                         "aggregation": 4, "channel_dwell_ms": 0,
+                         "cca_attempts": 16,
+                         # existing acquisition knobs (same saved set)
+                         "mode": 0, "band": 0, "sweep_ms": 1000,
+                         "fft_size": 64, "sample_rate_khz": 20000}
+
+    def __init__(self, start_demo: bool = False, *, settings=None) -> None:
         super().__init__()
         self.setWindowTitle("ESP32-C5 Wi-Fi Spectrum Analyzer")
         self.resize(1480, 940)
+
+        self._settings = settings
+        # acquisition selection read from the store (applied AFTER the
+        # initial _set_band/_on_mode_changed so defaults never overwrite
+        # a persisted value before it is used)
+        self._loaded_acq_mode = 0
+        self._loaded_acq_band = 0
 
         self.source = None              # SerialReader | MockSource | None
         # Explicit source/capability state (replaces the old stack-index
@@ -191,6 +208,20 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._frames, self._fps, self._fps_t = 0, 0.0, time.monotonic()
         self._util: dict[int, float] = {}   # ch -> percent (int in demo)
+        # display/settings state (items 4/6): aggregate window, waterfall
+        # rows, TextItem/cell/brush reuse caches and the write counter
+        self._util_agg = self.SETTINGS_DEFAULTS["aggregation"]
+        self._hist_rows = self.SETTINGS_DEFAULTS["history_rows"]
+        self._cell_last: dict[tuple, str] = {}
+        self._cell_writes = 0
+        self._brush_cache: dict[float, object] = {}
+        self._util_label_last: dict[int, str] = {}
+        # Debounced acquisition apply (item 5): widget edits coalesce into
+        # ONE CONFIG after the last change instead of resetting the device
+        # mid-edit; the Apply button sends immediately.
+        self._cfg_debounce = QTimer(self)
+        self._cfg_debounce.setSingleShot(True)
+        self._cfg_debounce.timeout.connect(self._send_config)
         # One bounded CONFIG-retry chain, owned by a single-shot QTimer:
         # re-armed with the latest requested tuple on every change, stopped
         # on ack/detach/demo/legacy/error (see _send_config/_retry_config).
@@ -204,6 +235,11 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+        # render throttle timer FIRST: the settings panel (built below)
+        # may load a persisted FPS and must be able to re-interval it
+        self._render_timer = QTimer(self)        # throttle redraws
+        self._render_timer.timeout.connect(self._render)
+        self._render_timer.start(33)
         root.addWidget(self._build_topbar())
         body = QHBoxLayout()
         body.setContentsMargins(20, 20, 20, 16)
@@ -218,10 +254,7 @@ class MainWindow(QMainWindow):
         self._on_mode_changed(0)
         self._update_acquisition_controls()
         self._update_power_units()
-
-        self._render_timer = QTimer(self)        # throttle redraws to ~30 fps
-        self._render_timer.timeout.connect(self._render)
-        self._render_timer.start(33)
+        self._load_acquisition_selection()   # persisted mode/band applied
 
         if start_demo:
             self.demo_btn.setChecked(True)
@@ -246,10 +279,14 @@ class MainWindow(QMainWindow):
 
         self.mode_tabs = Segmented(["Live", "Band Sweep"])
         self.mode_tabs.currentChanged.connect(self._on_mode_changed)
+        self.mode_tabs.currentChanged.connect(
+            lambda i: self._persist("mode", i))
         lay.addWidget(self.mode_tabs)
 
         self.band_seg = Segmented([BANDS[BAND_24].name, BANDS[BAND_5].name])
         self.band_seg.currentChanged.connect(self._set_band)
+        self.band_seg.currentChanged.connect(
+            lambda i: self._persist("band", i))
         lay.addWidget(self.band_seg)
         lay.addWidget(_vsep())
 
@@ -266,7 +303,9 @@ class MainWindow(QMainWindow):
         self.sweep_time.setValue(1000)
         self.sweep_time.setSuffix(" ms")
         self.sweep_time.setFixedWidth(104)
-        self.sweep_time.valueChanged.connect(self._send_config)
+        self.sweep_time.valueChanged.connect(self._schedule_config)
+        self.sweep_time.valueChanged.connect(
+            lambda v: self._persist("sweep_ms", v))
         lay.addWidget(_labeled("Sweep", self.sweep_time))
 
         self.sweep_count = QSpinBox()
@@ -411,11 +450,16 @@ class MainWindow(QMainWindow):
         fl.setVerticalSpacing(10)
         self.fft_combo = QComboBox()
         self.fft_combo.addItems(["64", "128", "256", "512", "1024"])
-        self.fft_combo.currentTextChanged.connect(self._send_config)
+        self.fft_combo.currentTextChanged.connect(self._schedule_config)
+        self.fft_combo.currentTextChanged.connect(
+            lambda t: self._persist("fft_size", int(t)))
         fl.addRow("FFT size", self.fft_combo)
         self.sr_combo = QComboBox()
         self.sr_combo.addItems(["20 MS/s", "40 MS/s"])
-        self.sr_combo.currentTextChanged.connect(self._send_config)
+        self.sr_combo.currentTextChanged.connect(self._schedule_config)
+        self.sr_combo.currentTextChanged.connect(
+            lambda t: self._persist("sample_rate_khz",
+                                    int(t.split()[0]) * 1000))
         fl.addRow("Sample rate", self.sr_combo)
         self.rbw_lbl = _value()
         fl.addRow("RBW", self.rbw_lbl)
@@ -440,6 +484,58 @@ class MainWindow(QMainWindow):
         reset.clicked.connect(self._reset_peak)
         self.peak_reset_btn = reset
         vl.addWidget(reset)
+        lay.addWidget(g)
+
+        # settings (items 4/5): display knobs apply immediately; the
+        # acquisition pair (dwell/attempts) goes out through Apply
+        g = QGroupBox("SETTINGS")
+        fl = QFormLayout(g)
+        fl.setVerticalSpacing(10)
+        self.dwell_spin = QSpinBox()
+        self.dwell_spin.setRange(0, 2000)
+        self.dwell_spin.setSingleStep(10)
+        self.dwell_spin.setSpecialValueText("Auto")
+        self.dwell_spin.setFixedWidth(104)
+        fl.addRow("Dwell", self.dwell_spin)
+        self.attempts_spin = QSpinBox()
+        self.attempts_spin.setRange(1, 32)
+        self.attempts_spin.setValue(16)
+        self.attempts_spin.setFixedWidth(104)
+        fl.addRow("CCA attempts", self.attempts_spin)
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(5, 60)
+        self.fps_spin.setValue(30)
+        self.fps_spin.setSuffix(" fps")
+        self.fps_spin.setFixedWidth(104)
+        fl.addRow("Refresh", self.fps_spin)
+        self.hist_spin = QSpinBox()
+        self.hist_spin.setRange(50, 1000)
+        self.hist_spin.setValue(200)
+        self.hist_spin.setSuffix(" rows")
+        self.hist_spin.setFixedWidth(104)
+        fl.addRow("WF history", self.hist_spin)
+        self.agg_spin = QSpinBox()
+        self.agg_spin.setRange(1, 16)
+        self.agg_spin.setValue(4)
+        self.agg_spin.setSpecialValueText("Raw")
+        self.agg_spin.setFixedWidth(104)
+        fl.addRow("Util visits", self.agg_spin)
+        buttons = QVBoxLayout()
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.clicked.connect(self._send_config)
+        self.reset_settings_btn = QPushButton("Reset defaults")
+        self.reset_settings_btn.clicked.connect(self._reset_settings)
+        buttons.addWidget(self.apply_btn)
+        buttons.addWidget(self.reset_settings_btn)
+        fl.addRow("", buttons)
+        self.fps_spin.valueChanged.connect(self._on_fps_changed)
+        self.hist_spin.valueChanged.connect(self._on_hist_changed)
+        self.agg_spin.valueChanged.connect(self._on_agg_changed)
+        self.dwell_spin.valueChanged.connect(
+            lambda v: self._persist("channel_dwell_ms", v))
+        self.attempts_spin.valueChanged.connect(
+            lambda v: self._persist("cca_attempts", v))
+        self._load_settings()
         lay.addWidget(g)
 
         # dB range
@@ -519,7 +615,7 @@ class MainWindow(QMainWindow):
         self.cur = np.full(info.n_points, fill, dtype=np.float32)
         self.peak = np.full(info.n_points, np.nan if real else -200.0,
                             dtype=np.float32)
-        self.wf = np.full((WATERFALL_ROWS, info.n_points), fill,
+        self.wf = np.full((self._hist_rows, info.n_points), fill,
                           dtype=np.float32)
         self._rf_covered = np.zeros(info.n_points, dtype=bool)
         self._rf_cycle = None
@@ -533,7 +629,7 @@ class MainWindow(QMainWindow):
         self.freqs = np.linspace(info.f_start, info.f_stop, info.n_points)
         floor = float(self.db_min.value())
         self._init_display_arrays()
-        self._wf_rect = QRectF(info.f_start, 0, info.f_stop - info.f_start, WATERFALL_ROWS)
+        self._wf_rect = QRectF(info.f_start, 0, info.f_stop - info.f_start, self._hist_rows)
         self.wf_img.setImage(self.wf, autoLevels=False, levels=(floor, self.db_max.value()))
         self.wf_img.setRect(self._wf_rect)
         self.sweeps_done = 0
@@ -541,7 +637,7 @@ class MainWindow(QMainWindow):
 
         for p in (self.spec_plot, self.wf_plot, self.util_plot):
             p.getViewBox().setLimits(xMin=info.f_start, xMax=info.f_stop)
-        self.wf_plot.getViewBox().setYRange(0, WATERFALL_ROWS, padding=0)
+        self.wf_plot.getViewBox().setYRange(0, self._hist_rows, padding=0)
         self._reset_x()
 
         # channel markers on the spectrum + channel ticks on the bar axis
@@ -567,6 +663,7 @@ class MainWindow(QMainWindow):
         self.wf_plot.getAxis("bottom").setTicks([mhz_ticks, []])
 
         self.ch_table.setRowCount(len(info.channels))
+        self._cell_last.clear()       # fresh items: writes must not skip
         for r, ch in enumerate(info.channels):
             for c, txt in enumerate((str(ch), f"{channel_freq(band, ch):.0f}", "—", "—")):
                 it = QTableWidgetItem(txt)
@@ -576,7 +673,7 @@ class MainWindow(QMainWindow):
         if self._monitor_view():
             self._reset_monitor(WAITING_TEXT)
         self._update_power_units()
-        self._send_config()
+        self._schedule_config()
         self._dirty = True
 
     def _on_mode_changed(self, idx: int) -> None:
@@ -663,11 +760,15 @@ class MainWindow(QMainWindow):
             sizes = [str(s) for s in caps.get("fft_sizes", [])]
             rates = [f"{int(r['span_khz']) // 1000} MS/s"
                      for r in caps.get("rate_codes", [])]
-            self._set_combo_items(self.fft_combo, sizes,
-                                  str(eff.get("fft_size", "")))
-            self._set_combo_items(
-                self.sr_combo, rates,
-                f"{int(eff.get('span_khz', 0)) // 1000} MS/s")
+            # while an edit is pending (armed debounce) the effective
+            # values still describe the OLD config: bind the option LISTS
+            # but never force the selection over the user's pending choice
+            pending = self._cfg_debounce.isActive()
+            select = None if pending else str(eff.get("fft_size", ""))
+            rate_select = (None if pending else
+                           f"{int(eff.get('span_khz', 0)) // 1000} MS/s")
+            self._set_combo_items(self.fft_combo, sizes, select)
+            self._set_combo_items(self.sr_combo, rates, rate_select)
             enabled = True
         elif self._monitor_view():
             enabled = False               # monitor-only FW: no FFT support
@@ -801,8 +902,138 @@ class MainWindow(QMainWindow):
             self.connect_btn.setChecked(False)
             self._set_conn("Error", "err")
 
+    # ---------------------------------------------------------- settings
+    def _persist(self, key: str, value) -> None:
+        if self._settings is not None:
+            self._settings.setValue(key, int(value))
+
+    def _load_settings(self) -> None:
+        """Validate and clamp persisted values (item 5); a missing or
+        corrupt entry falls back to the default. Ordinary fixtures pass
+        settings=None and never read or write a store."""
+        if self._settings is None:
+            return
+        items = [self.fft_combo.itemText(i)
+                 for i in range(self.fft_combo.count())]
+        sr_items = [self.sr_combo.itemText(i)
+                    for i in range(self.sr_combo.count())]
+        for key, default in self.SETTINGS_DEFAULTS.items():
+            raw = self._settings.value(key, default)
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = default
+            if key == "fps":
+                self.fps_spin.setValue(min(60, max(5, value)))
+            elif key == "history_rows":
+                self.hist_spin.setValue(min(1000, max(50, value)))
+            elif key == "aggregation":
+                self.agg_spin.setValue(min(16, max(1, value)))
+            elif key == "channel_dwell_ms":
+                # 0 = Auto; a nonzero override must be a real dwell
+                if value and value < 120:
+                    value = 120
+                self.dwell_spin.setValue(min(2000, value))
+            elif key == "cca_attempts":
+                self.attempts_spin.setValue(min(32, max(1, value)))
+            elif key == "mode":
+                self._loaded_acq_mode = value if value in (0, 1) else 0
+            elif key == "band":
+                self._loaded_acq_band = value if value in (0, 1) else 0
+            elif key == "sweep_ms":
+                self.sweep_time.setValue(min(10000, max(100, value)))
+            elif key == "fft_size":
+                text = str(value)
+                if text in items:
+                    self.fft_combo.setCurrentText(text)
+            elif key == "sample_rate_khz":
+                text = f"{value // 1000} MS/s"
+                if text in sr_items:
+                    self.sr_combo.setCurrentText(text)
+
+    def _load_acquisition_selection(self) -> None:
+        """Apply the persisted mode/band AFTER the initial defaults were
+        set, so a saved selection is neither lost nor applied before the
+        widgets it drives exist."""
+        if self._settings is None:
+            return
+        if self.mode_tabs.currentIndex() != self._loaded_acq_mode:
+            self.mode_tabs.setCurrentIndex(self._loaded_acq_mode)
+        if self.band_seg.currentIndex() != self._loaded_acq_band:
+            self.band_seg.setCurrentIndex(self._loaded_acq_band)
+
+    def _reset_settings(self) -> None:
+        """Restore every SAVED knob to its default (persisted too, even
+        when a widget was already at its default and emitted no signal)."""
+        defaults = self.SETTINGS_DEFAULTS
+        self.mode_tabs.setCurrentIndex(defaults["mode"])
+        self.band_seg.setCurrentIndex(defaults["band"])
+        self.sweep_time.setValue(defaults["sweep_ms"])
+        self.fft_combo.setCurrentText(str(defaults["fft_size"]))
+        self.sr_combo.setCurrentText(
+            f"{defaults['sample_rate_khz'] // 1000} MS/s")
+        self.fps_spin.setValue(defaults["fps"])
+        self.hist_spin.setValue(defaults["history_rows"])
+        self.agg_spin.setValue(defaults["aggregation"])
+        self.dwell_spin.setValue(defaults["channel_dwell_ms"])
+        self.attempts_spin.setValue(defaults["cca_attempts"])
+        for key, default in defaults.items():
+            self._persist(key, default)
+
+    def _on_fps_changed(self, value: int) -> None:
+        # display refresh is display-only: bound the existing render
+        # timer, never a CONFIG (item 6 - bounded repaint frequency)
+        self._persist("fps", value)
+        self._render_timer.start(max(16, 1000 // int(value)))
+
+    def _on_hist_changed(self, value: int) -> None:
+        self._persist("history_rows", value)
+        new_rows = int(value)
+        old = getattr(self, "wf", None)
+        self._hist_rows = new_rows
+        if old is None or getattr(self, "freqs", None) is None:
+            return                  # not initialized yet: picked up later
+        # resize while PRESERVING the newest min(old, new) rows at the
+        # TOP: _push_row prepends the newest row at wf[0], so the newest
+        # rows are old[:keep] (bottom/oldest rows are dropped on shrink,
+        # fresh fill rows appear below on growth). cur/peak/util/coverage
+        # stay untouched (no _init_display_arrays) and no CONFIG is sent
+        # for this display-only knob
+        keep = min(int(old.shape[0]), new_rows)
+        fill = np.nan if self._real_path() else float(self.db_min.value())
+        grown = np.full((new_rows, int(old.shape[1])), fill,
+                        dtype=np.float32)
+        grown[:keep] = old[:keep]
+        self.wf = grown
+        info = BANDS[self.band]
+        self._wf_rect = QRectF(info.f_start, 0,
+                               info.f_stop - info.f_start, new_rows)
+        self.wf_img.setImage(self.wf, autoLevels=False,
+                             levels=(self.db_min.value(),
+                                     self.db_max.value()))
+        self.wf_img.setRect(self._wf_rect)
+        self.wf_plot.getViewBox().setYRange(0, new_rows, padding=0)
+
+    def _on_agg_changed(self, value: int) -> None:
+        self._persist("aggregation", value)
+        self._util_agg = int(value)
+        if self._monitor_view():
+            self._sync_util_from_state()
+        else:
+            self._update_util_bars()   # demo: original layout, shared
+        self._sync_util_caption()
+
+    def _schedule_config(self, *_):
+        """Debounce acquisition edits into ONE CONFIG after the last
+        change (item 5): no mid-edit device resets. The armed timer is
+        the pending-edit state read by _update_acquisition_controls."""
+        self._cfg_debounce.start(400)
+
     def _send_config(self, *_):
-        """Push current settings to the device as a CONFIG TLV (0x10)."""
+        """Push current settings to the device as a CONFIG TLV (0x10).
+        An explicit send (Apply/opened/attach) supersedes any pending
+        debounced send - exactly one effective CONFIG per settled intent."""
+        self._cfg_debounce.stop()
         if not hasattr(self, "sr_combo"):
             return
         self._update_rbw()
@@ -810,9 +1041,11 @@ class MainWindow(QMainWindow):
             return
         fields = (self.mode, self.band, self.sweep_time.value(),
                   int(self.fft_combo.currentText()),
-                  int(self.sr_combo.currentText().split()[0]) * 1000)
+                  int(self.sr_combo.currentText().split()[0]) * 1000,
+                  self._effective_dwell_request(),
+                  self.attempts_spin.value())
         if self._monitor_view():
-            # an echo of these five fields is the device's acknowledgement
+            # an echo of these seven fields is the device's acknowledgement
             self.monitor_state.request(*fields)
         self.source.write(tlv.encode_config(*fields))
         if self._monitor_view() and isinstance(self.source, SerialReader):
@@ -822,6 +1055,12 @@ class MainWindow(QMainWindow):
             self._cfg_timer.start(CFG_RETRY_MS)
         else:
             self._cfg_timer.stop()
+
+    def _effective_dwell_request(self) -> int:
+        """channel_dwell_ms for CONFIG: 0 = Auto, otherwise a real dwell
+        (the wire contract only allows 0 or 120..2000 ms)."""
+        value = int(self.dwell_spin.value())
+        return 0 if value == 0 else max(120, value)
 
     def _retry_config(self) -> None:
         """Bounded resend of the latest CONFIG until a fresh matching ack.
@@ -898,13 +1137,24 @@ class MainWindow(QMainWindow):
         self._push_row()             # live: one waterfall row per frame
 
     def _sync_util_from_state(self) -> None:
-        """Rebuild the display map from MonitorState's published util set
-        (live per channel, sweep flushed at the marker, gaps on missing/
-        failed/capability change). Float percent keeps the raw fraction for
-        bars/data; labels round only at formatting time."""
-        self._util = {ch: 100.0 * s["busy"] / s["total"]
-                      for ch, s in self.monitor_state.util_samples.items()}
+        """Rebuild the display map from MonitorState's published set:
+        aggregate SUM(busy)/SUM(total) over the latest `_util_agg` visits
+        (never an average of rounded percent; raw option = latest only).
+        Float percent keeps the raw fraction for bars/data; labels round
+        only at formatting time."""
+        state = self.monitor_state
+        n = self._util_agg
+        util: dict[int, float] = {}
+        for ch, sample in state.util_samples.items():
+            use = state.util_history.get(ch, [])[-n:]
+            if use:
+                util[ch] = (100.0 * sum(e[1] for e in use)
+                            / sum(e[2] for e in use))
+            else:
+                util[ch] = 100.0 * sample["busy"] / sample["total"]
+        self._util = util
         self._update_util_bars()
+        self._sync_util_caption()
 
     def _on_util(self, msg: tlv.ChannelUtil) -> None:
         # RF mode takes utilization ONLY from the epoch'd STATUS channel
@@ -1087,51 +1337,104 @@ class MainWindow(QMainWindow):
             self.wf_img.setRect(self._wf_rect)
         self._update_peak_column()
 
-    @staticmethod
-    def _util_tooltip(sample: dict | None) -> str:
-        """Raw metadata tooltip for the pooled contract: window_us_upper
-        is the sum of sampled short windows (NEVER the dwell span) with
-        the actual valid/attempted counts."""
+    def _sync_util_caption(self) -> None:
+        """Caption reflects availability AND active averaging: AVG is
+        marked only when an aggregate view actually combines visits, so a
+        raw (single-visit) view never claims averages."""
+        active = any(len(h) > 1
+                     for h in self.monitor_state.util_history.values())
+        avg = (f" · AVG {self._util_agg} visits"
+               if self._util_agg > 1 and active else "")
+        self.util_card.cap_lbl.setText(
+            "UTILIZATION · % · UNAVAILABLE"
+            if self._rf_active and not self.monitor_state.utilization_available
+            else f"UTILIZATION · %{avg}")
+
+    def _util_tooltip(self, ch: int) -> str:
+        """Raw metadata first (last measurement), then - when averaging
+        over visits is on - the distinct aggregate: sums, contributing
+        count and time span. Never implies a whole-dwell average."""
+        state = self.monitor_state
+        sample = state.util_samples.get(ch)
         if sample is None:
-            return ""
-        return (f"Sampled PHY CCA (experimental): busy {sample['busy']} / "
+            return ("Sampled PHY CCA (experimental): no valid sample (gap)"
+                    if self._rf_active else "")
+        head = (f"Sampled PHY CCA (experimental): busy {sample['busy']} / "
                 f"total {sample['total']} ticks · window_us_upper "
                 f"{sample['window_us_upper']} µs = sum of "
                 f"{sample['samples']} valid of {sample['attempted']} "
                 "attempted sampled windows (not the dwell span)")
+        use = state.util_history.get(ch, [])[-self._util_agg:]
+        if len(use) > 1:
+            sum_busy = sum(e[1] for e in use)
+            sum_total = sum(e[2] for e in use)
+            span = use[-1][3] - use[0][3]
+            latest = 100.0 * sample["busy"] / sample["total"]
+            head += (f" · aggregate: sum busy {sum_busy} / sum total "
+                     f"{sum_total} = {100.0 * sum_busy / sum_total:.1f} % "
+                     f"over {len(use)} visits (latest raw {latest:.0f} %, "
+                     f"span {span:.1f} s - avg of visits, not dwell)")
+        return head
+
+    def _write_cell(self, row: int, col: int, item, text: str) -> None:
+        """Skip unchanged table writes (item 6): only a different string
+        reaches setText; `_cell_writes` counts actual writes only."""
+        if self._cell_last.get((row, col)) == text:
+            return
+        self._cell_last[(row, col)] = text
+        self._cell_writes += 1
+        item.setText(text)
 
     def _update_util_bars(self) -> None:
         info = BANDS[self.band]
         xs = [channel_freq(self.band, ch) for ch in info.channels]
         hs = [self._util.get(ch, 0) for ch in info.channels]
-        brushes = [pg.mkBrush(theme.util_color(h)) for h in hs]
+        # brush cache (item 6): unchanged heights reuse the same QBrush
+        brushes = []
+        for h in hs:
+            brush = self._brush_cache.get(h)
+            if brush is None:
+                brush = pg.mkBrush(theme.util_color(h))
+                if len(self._brush_cache) >= 512:   # bounded
+                    self._brush_cache.clear()
+                self._brush_cache[h] = brush
+            brushes.append(brush)
         width = 3.6 if self.band == BAND_24 else 15
         self.util_bars.setOpts(x=xs, height=hs, width=width, brushes=brushes,
                                pen=pg.mkPen(None))
-        # % labels above bars
-        for t in self.util_texts:
-            self.util_plot.removeItem(t)
-        self.util_texts = []
-        if self._util:
+        # % labels above bars: ONE TextItem per channel, REUSED instead of
+        # destroyed/recreated every repaint (item 6)
+        if len(self.util_texts) != len(info.channels):
+            for t in self.util_texts:
+                self.util_plot.removeItem(t)
             font = theme.mono_font(7.5)
-            for x, h, ch in zip(xs, hs, info.channels, strict=True):
-                if ch not in self._util:
-                    continue        # gap: no label that claims a value
-                t = pg.TextItem(f"{h:.0f}", color=C["body"], anchor=(0.5, 1))
+            self.util_texts = []
+            for _ in info.channels:
+                t = pg.TextItem("", color=C["body"], anchor=(0.5, 1))
                 t.setFont(font)
-                t.setPos(x, h)
                 self.util_plot.addItem(t)
                 self.util_texts.append(t)
+            self._util_label_last = {}
+        for x, h, ch, t in zip(xs, hs, info.channels, self.util_texts,
+                               strict=True):
+            if ch not in self._util:
+                t.setVisible(False)   # gap: no label that claims a value
+                continue
+            t.setVisible(True)
+            label = f"{h:.0f}"
+            if self._util_label_last.get(ch) != label:
+                t.setText(label)
+                self._util_label_last[ch] = label
+            t.setPos(x, h)
         for r, ch in enumerate(info.channels):
             it = self.ch_table.item(r, 2)
             if it is None:
                 continue
             if ch in self._util:
-                it.setText(f"{self._util[ch]:.0f} %")
-                it.setToolTip(self._util_tooltip(
-                    self.monitor_state.util_samples.get(ch)))
+                self._write_cell(r, 2, it, f"{self._util[ch]:.0f} %")
+                it.setToolTip(self._util_tooltip(ch))
             else:
-                it.setText("—")
+                self._write_cell(r, 2, it, "—")
                 it.setToolTip(
                     "Sampled PHY CCA (experimental): no valid sample (gap)"
                     if self._rf_active else "")
@@ -1145,9 +1448,10 @@ class MainWindow(QMainWindow):
             vals = vals[np.isfinite(vals)]
             it = self.ch_table.item(r, 3)
             if it is not None:
-                # always write: NaN / sentinel (-200) shows the gap "—"
-                it.setText(f"{vals.max():.0f}"
-                           if vals.size and vals.max() > -199 else "—")
+                # always compute: NaN / sentinel (-200) shows the gap "—"
+                self._write_cell(r, 3, it,
+                                 f"{vals.max():.0f}"
+                                 if vals.size and vals.max() > -199 else "—")
 
     # ============================================================ UI helpers
     def _apply_db_range(self) -> None:
@@ -1192,6 +1496,7 @@ class MainWindow(QMainWindow):
             "UTILIZATION · % · UNAVAILABLE"
             if self._rf_active and not self.monitor_state.utilization_available
             else "UTILIZATION · %")
+        self._sync_util_caption()
         if self._rf_active and self.monitor_state.utilization_available:
             self.util_card.setToolTip(
                 f"Sampled PHY CCA (experimental) · source={UTIL_SOURCE} · "
