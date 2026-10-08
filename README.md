@@ -197,8 +197,8 @@ Store local evidence under an ignored directory such as `.local/` or `captures/`
 
 Before committing, run `python3 scripts/check_public_files.py`. To enable the
 staged-file check locally, run `git config --local core.hooksPath .githooks`
-(integrate with an existing hook instead of replacing it). GitHub Actions also
-checks the committed snapshot. The check reports paths and rule names, not the
+(integrate with an existing hook instead of replacing it). This is a local
+check, not a CI gate. The check reports paths and rule names, not the
 matched values. It detects common machine identifiers; it is not a comprehensive
 secret scanner and does not inspect image pixels. Review screenshots manually
 and use synthetic Demo data for public examples.
@@ -206,6 +206,14 @@ and use synthetic Demo data for public examples.
 Deleting a published value in a later commit does not remove it from Git
 history. History cleanup requires coordinated rewriting and updating other
 clones; cached GitHub views or third-party copies can remain accessible.
+
+## Continuous integration
+
+GitHub Actions runs static analysis and build checks only: Ruff and Pyright for
+the Python sources, tests and scripts; a GUI wheel/source-distribution build;
+and an ESP32-C5 firmware build with ESP-IDF v6.0.3. CI does not run tests,
+hardware checks or the public-file policy checker. Tests remain available
+locally with `make test`.
 
 ## Files
 
