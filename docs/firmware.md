@@ -231,6 +231,13 @@ and disconnect/reconnect. Screenshots were inspected for actual RF traces,
 dBFS units, populated waterfall history and utilization. Local evidence is
 not published because captures can contain nearby AP identifiers.
 
+A separate physical Live callback check observed a completed 13-channel cycle
+followed by channel 1 of the next cycle. Channels 2–13 retained their previous
+bar heights and table values unchanged. It also verified a two-visit weighted
+ratio against the displayed value and raw-metadata tooltip; all 76 assertions
+passed, and the serial port was released. This checks the original disappearance
+at the cycle boundary rather than inferring retention from a finished screenshot.
+
 For the original Live regression's synthetic 112-event GUI input, the cumulative
 utilization-bar update time decreased from 0.984 s with retention alone to
 0.039 s with label reuse. This is a PC-side profile, not MCU throughput or RF
