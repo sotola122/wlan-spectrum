@@ -864,7 +864,7 @@ class UtilContractTests(unittest.TestCase):
     def test_channel_error_invalidates_staged_and_published_util(self) -> None:
         err = {"schema": "wifi-monitor/1", "event": "channel_error",
                "epoch": 1, "cycle": 1, "band": 0, "ch": 6,
-               "code": "spectrum_capture"}
+               "code": "ESP_ERR_TIMEOUT"}
         # live, before any marker: the published value dies immediately
         self.assertTrue(self._ack(self.cap()))
         self.assertTrue(self.state.accept(
@@ -986,6 +986,47 @@ class LiveRetentionAndConfig7Tests(unittest.TestCase):
         self.state.accept(config_event(
             utilization={"available": False, "blocker": "x"}))
         self.assertFalse(self.state.util_history.get(6))
+
+    def test_closed_cycle_error_cannot_erase_measurement(self) -> None:
+        self.ack()
+        self.feed([6], 1)
+        sample = self.state.util_samples[6].copy()
+        history = self.state.util_history[6].copy()
+        error = {"schema": "wifi-monitor/1", "event": "channel_error",
+                 "epoch": 1, "band": 0, "cycle": 1, "ch": 6,
+                 "code": "ESP_ERR_TIMEOUT"}
+        self.assertFalse(self.state.accept(error))
+        self.assertEqual(self.state.util_samples[6], sample)
+        self.assertEqual(self.state.util_history[6], history)
+        self.assertIsNone(self.state.last_error)
+        for cycle in (-1, 0x100000000, True, None):
+            with self.subTest(cycle=cycle), self.assertRaises(ValueError):
+                self.state.accept({**error, "cycle": cycle})
+
+    def test_live_marker_does_not_change_measurement_time(self) -> None:
+        now = [0.0]
+        self.state = MonitorState(clock=lambda: now[0])
+        self.state.request(**CFG)
+        self.ack()
+        self.state.accept(channel_event(cycle=1, ch=6, util=self.util()))
+        history = self.state.util_history[6].copy()
+        now[0] = 10.0
+        self.state.accept(cycle_event(cycle=1))
+        self.assertEqual(self.state.util_history[6], history)
+
+    def test_lost_sweep_marker_breaks_only_missing_channel_history(self) -> None:
+        self.state.request(**{**CFG, "mode": 1})
+        self.state.accept(config_event(mode=1, utilization=self.cap()))
+        self.feed([1, 6], 1, busy=0)
+        self.state.accept(channel_event(cycle=2, ch=1, util=self.util()))
+        # No ch6 and no marker for cycle2. Keep the published sweep atomic.
+        self.state.accept(channel_event(cycle=3, ch=6, util=self.util(1000)))
+        self.assertEqual(self.state.util_samples[6]["busy"], 0)
+        self.state.accept(channel_event(cycle=3, ch=1, util=self.util(1000)))
+        self.state.accept(cycle_event(cycle=3))
+        self.assertEqual([h[0] for h in self.state.util_history[6]], [3])
+        # ch1 really was observed in cycle2, so its old history is valid.
+        self.assertEqual([h[0] for h in self.state.util_history[1]], [1, 3])
 
     def test_config_ack_must_echo_all_seven_fields(self) -> None:
         st = MonitorState()

@@ -16,9 +16,10 @@ import unittest
 from unittest import mock
 
 import numpy as np
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint
+from PySide6.QtWidgets import QApplication, QScrollArea
 
-from wifi_spectrum import main_window, tlv
+from wifi_spectrum import main_window, theme, tlv
 from wifi_spectrum.bands import BANDS
 from wifi_spectrum.main_window import (
     DISCONNECTED_TEXT,
@@ -30,6 +31,8 @@ from wifi_spectrum.monitor_data import UTIL_CONFIDENCE, UTIL_SOURCE
 from wifi_spectrum.serial_link import SerialReader
 
 APP = QApplication.instance() or QApplication([])
+assert isinstance(APP, QApplication)
+theme.apply_theme(APP)
 
 CFG_DEFAULTS = {"mode": 0, "band": 0, "sweep_ms": 1000, "fft_size": 64,
                 "sample_rate_khz": 20000, "channel_dwell_ms": 0,
@@ -313,6 +316,42 @@ class RfRenderingTests(unittest.TestCase):
                   self.win.peak_reset_btn):
             self.assertTrue(w.isEnabled())
 
+    def test_live_waterfall_publishes_once_per_completed_scan(self) -> None:
+        self.ack()
+        self.fx.deliver(rf_blob(cycle=1, ch=1, center_khz=2412000,
+                                power=[-40.0] * 8))
+        self.fx.deliver(rf_blob(cycle=1, ch=13, center_khz=2472000,
+                                power=[-60.0] * 8))
+        self.win._render()
+        self.assertTrue(np.isnan(self.win.wf).all(),
+                        "Live waterfall must wait for the completed scan")
+        self.assertAlmostEqual(self.val_at(2412.0), -40.0)
+        self.assertAlmostEqual(self.val_at(2472.0), -60.0)
+        self.deliver(cycle_event(cycle=1))
+        self.win._render()
+        completed_row = self.win.wf[0].copy()
+        self.assertAlmostEqual(self.val_at(2412.0, completed_row), -40.0)
+        self.assertAlmostEqual(self.val_at(2472.0, completed_row), -60.0)
+        self.assertTrue(np.isnan(self.win.wf[1]).all())
+        self.fx.deliver(rf_blob(cycle=2, ch=1, center_khz=2412000,
+                                power=[-50.0] * 8))
+        self.win._render()
+        # The rendered curve, not only the channel table, keeps ch13.
+        _, plotted = self.win.cur_curve.getData()
+        self.assertAlmostEqual(self.val_at(2472.0, plotted), -60.0)
+        np.testing.assert_equal(self.win.wf[0], completed_row)
+        self.fx.deliver(rf_blob(cycle=2, ch=13, center_khz=2472000,
+                                power=[-70.0] * 8))
+        self.deliver(cycle_event(cycle=2))
+        self.win._render()
+        self.assertAlmostEqual(self.val_at(2412.0, self.win.wf[0]), -50.0)
+        self.assertAlmostEqual(self.val_at(2472.0, self.win.wf[0]), -70.0)
+        np.testing.assert_equal(self.win.wf[1], completed_row)
+        np.testing.assert_equal(self.win.wf_img.image, self.win.wf)
+        before_duplicate = self.win.wf.copy()
+        self.deliver(cycle_event(cycle=2))
+        np.testing.assert_equal(self.win.wf, before_duplicate)
+
     def test_frame_renders_cur_peak_waterfall_and_sidebar(self) -> None:
         self.ack()
         blob = rf_blob(ch=6, power=[-30.0] * 8)
@@ -335,7 +374,10 @@ class RfRenderingTests(unittest.TestCase):
                                places=3)
         self.assertTrue(np.isnan(self.win.peak[np.abs(
             self.win.freqs - 2470.0) < 0.1]).all())
-        # waterfall: one live row, gaps transparent in the row too
+        # Live spectrum updates immediately; waterfall waits for the marker.
+        self.assertTrue(np.isnan(self.win.wf).all())
+        self.deliver(cycle_event(cycle=1))
+        # One completed row, gaps transparent in the row too.
         self.assertAlmostEqual(
             self.val_at(2437.0, self.win.wf[0]), -30.0, places=3)
         self.assertTrue(np.isnan(self.win.wf[0])[
@@ -349,6 +391,32 @@ class RfRenderingTests(unittest.TestCase):
                                    row_of(self.win, 13), 3), "—")
         self.assertEqual(cell_text(self.win.ch_table,
                                    row_of(self.win, 6), 2), "—")
+
+    def test_live_late_marker_cannot_clear_current_scan(self) -> None:
+        self.ack()
+        self.fx.deliver(rf_blob(cycle=1, ch=1, center_khz=2412000))
+        self.deliver(cycle_event(cycle=1))
+        self.fx.deliver(rf_blob(cycle=2, ch=6, center_khz=2437000))
+        # Marker2 is delayed until cycle3 has begun.
+        self.fx.deliver(rf_blob(cycle=3, ch=1, center_khz=2412000,
+                                power=[-50.0] * 8))
+        before = self.win.cur.copy()
+        history = self.win.wf.copy()
+        self.deliver(cycle_event(cycle=2))
+        self.win._render()
+        np.testing.assert_equal(self.win.cur_curve.getData()[1], before)
+        np.testing.assert_equal(self.win.wf, history)
+        # A late older RF frame must not roll coverage backwards either.
+        self.fx.deliver(rf_blob(cycle=2, ch=13, center_khz=2472000))
+        np.testing.assert_equal(self.win.cur, before)
+
+    def test_live_missing_scan_cannot_publish_previous_scan_as_waterfall(self) -> None:
+        self.ack()
+        self.fx.deliver(rf_blob(cycle=1))
+        # Marker1 lost; marker2 arrives without any cycle2 captures.
+        self.deliver(cycle_event(cycle=2))
+        self.assertTrue(np.isnan(self.win.wf[0]).all())
+        self.assertTrue(np.isnan(self.win.cur).all())
 
     def test_stale_epoch_band_and_closed_cycle_frames_dropped(self) -> None:
         self.ack()
@@ -603,7 +671,7 @@ class RfRenderingTests(unittest.TestCase):
         # failed dwell: the published percent dies before any marker
         self.deliver({"schema": SCHEMA, "event": "channel_error",
                       "epoch": 1, "cycle": 1, "band": 0, "ch": 6,
-                      "code": "spectrum_capture"})
+                      "code": "ESP_ERR_TIMEOUT"})
         self.assertEqual(cell_text(self.win.ch_table, row_of(self.win, 6),
                                    2), "—")
         self.assertNotIn(6, self.win._util)
@@ -1164,6 +1232,29 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
                                    "source": UTIL_SOURCE,
                                    "confidence": UTIL_CONFIDENCE})))
 
+    def test_added_settings_visible_without_scrolling(self) -> None:
+        for width, height in ((1480, 940), (1280, 720)):
+            with self.subTest(size=(width, height)):
+                self.win.resize(width, height)
+                APP.processEvents()
+                self.assertEqual((self.win.width(), self.win.height()),
+                                 (width, height),
+                                 "toolbar must not force settings off-screen")
+                scroll = self.win.findChild(QScrollArea)
+                self.assertIsNotNone(scroll)
+                assert scroll is not None
+                scroll.verticalScrollBar().setValue(0)
+                viewport = scroll.viewport()
+                for name in ("dwell_spin", "attempts_spin", "fps_spin",
+                             "hist_spin", "agg_spin", "apply_btn",
+                             "reset_settings_btn"):
+                    control = getattr(self.win, name)
+                    rect = control.rect().translated(
+                        control.mapTo(viewport, QPoint(0, 0)))
+                    self.assertTrue(control.isVisible())
+                    self.assertTrue(viewport.rect().contains(rect),
+                                    f"{name} is clipped or below the fold")
+
     def test_live_retention_cells_survive_new_cycle(self) -> None:
         self.util_ack()
         for cycle in (1,):
@@ -1198,6 +1289,35 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
         self.win.agg_spin.setValue(1)
         self.win._sync_util_from_state()
         self.assertEqual(cell_text(self.win.ch_table, row, 2), "0 %")
+
+    def test_fft_failure_preserves_cca_average_in_both_modes(self) -> None:
+        for mode in (0, 1):
+            with self.subTest(mode=mode):
+                self.win.mode_tabs.setCurrentIndex(mode)
+                self.win.apply_btn.click()
+                self.util_ack()
+                row = row_of(self.win, 6)
+                def deliver(event):
+                    self.fx.deliver(tlv.encode_status_json(event))
+                for cycle in range(1, 4):
+                    deliver(channel_event(cycle=cycle, ch=6,
+                                          util=self.util(0)))
+                    deliver(cycle_event(cycle=cycle))
+                deliver(channel_event(cycle=4, ch=6, util=self.util(1000)))
+                before = np.array(self.win.util_bars.opts["height"], copy=True)
+                deliver({"schema": SCHEMA, "event": "channel_error",
+                         "epoch": 1, "cycle": 4, "band": 0, "ch": 6,
+                         "code": "spectrum_capture"})
+                self.assertEqual(cell_text(self.win.ch_table, row, 2),
+                                 "25 %" if mode == 0 else "0 %")
+                np.testing.assert_equal(self.win.util_bars.opts["height"], before)
+                self.assertIn("spectrum_capture", self.win.statusBar().currentMessage())
+                deliver(cycle_event(cycle=4))
+                self.assertEqual(cell_text(self.win.ch_table, row, 2), "25 %")
+                deliver(channel_event(cycle=5, ch=6, util=self.util(1000)))
+                deliver(cycle_event(cycle=5))
+                self.assertEqual(cell_text(self.win.ch_table, row, 2), "50 %")
+                self.assertAlmostEqual(np.asarray(self.win.util_bars.opts["height"])[row], 50.0)
 
     def test_settings_clamp_reset_apply_and_persistence(self) -> None:
         store = FakeSettings({"fps": 999, "history_rows": 10,

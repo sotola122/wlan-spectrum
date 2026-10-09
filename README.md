@@ -132,6 +132,9 @@ Mouse wheel / drag zooms and pans the frequency axis on all three plots together
 
 ### Measurement and display settings
 
+The **SETTINGS** group is at the top of the right sidebar, with the new controls
+and Apply visible without scrolling at 1280×720. Connection controls occupy a
+separate toolbar row so they do not force the sidebar beyond the window width.
 Measurement settings change device acquisition; display settings do not send CONFIG.
 
 | Setting | Range / default | Meaning |
@@ -140,7 +143,7 @@ Measurement settings change device acquisition; display settings do not send CON
 | CCA attempts | 1–32; default 16 | Target short PHY-counter windows distributed across a dwell; invalid or missed windows are reported, not invented |
 | Display refresh | 5–60 FPS; default 30 | Repaint rate, not the measurement or serial receive rate |
 | Waterfall history | 50–1000 rows; default 200 | Retained display history |
-| Utilization visits | 1–16; default 4 | Counter-weighted aggregation of recent valid visits per channel; 1 shows the latest raw result |
+| Util average | 1–16 scans; default 4 | Counter-weighted aggregation of recent valid visits per channel; Raw shows the latest result |
 
 Live retains the last result for other channels while the next scan visits them.
 Invalid measurements and channels missing from a completed cycle remain unavailable,
@@ -148,6 +151,11 @@ not zero. Sweep publishes a completed cycle together. Tooltips distinguish the
 latest raw measurement from the displayed aggregate and its contributing visits.
 Longer averaging can make the display steadier; it does not improve RF calibration
 or turn intermittent samples into continuous channel coverage.
+An FFT-only capture failure does not clear a valid CCA measurement or its average.
+In real-device Live and Band Sweep, Waterfall adds one row when the complete
+scan's cycle marker arrives, not on each channel frame. Live's spectrum still
+updates as channels arrive and retains the other channels until replacement or
+confirmed missing coverage. Late older-cycle frames and markers are ignored.
 
 Click **Apply** to send the selected dwell and CCA-attempt settings. Changes to
 FFT size, sample rate and Sweep time are sent after a short editing pause;

@@ -30,14 +30,19 @@ import threading
 import time
 
 import numpy as np
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from wifi_spectrum import tlv
 from wifi_spectrum.bands import BANDS, channel_freq
 from wifi_spectrum.main_window import DISCONNECTED_TEXT, MainWindow
 from wifi_spectrum.monitor_data import UTIL_CONFIDENCE, UTIL_SOURCE
+from wifi_spectrum.theme import apply_theme
 
 APP = QApplication.instance() or QApplication([])
+if not isinstance(APP, QApplication):
+    raise RuntimeError("Qt application is not a QApplication")
+apply_theme(APP)   # same seam as python -m wifi_spectrum
 
 SYNTHETIC_CHANNELS = {0: [1, 3, 6, 9, 11, 13],
                       1: [36, 40, 44, 100, 149, 153]}
@@ -447,6 +452,13 @@ def waterfall_rows(win: MainWindow) -> int:
     return int(sum(1 for row in win.wf if np.isfinite(row).any()))
 
 
+def scan_timeout(win: MainWindow) -> float:
+    """Bounded allowance for one complete traversal, not one RF frame."""
+    state = win.monitor_state
+    target_ms = (state.dwell_ms or 120) * len(state.channels)
+    return max(8.0, 2.0 * max(target_ms, state.elapsed_ms or 0) / 1000.0)
+
+
 def warmup_waterfall(win: MainWindow, rows: int = 30) -> None:
     """Wait for >=`rows` NEW waterfall rows with Qt pumping, prove the
     history shifted down and that serial bytes drove the rows, then
@@ -454,12 +466,13 @@ def warmup_waterfall(win: MainWindow, rows: int = 30) -> None:
     arrived: list[int] = []
     if win.source is not None:
         win.source.stats.connect(lambda rx, errors: arrived.append(rx))
-    wait(lambda: np.isfinite(win.wf[0]).any(), 8.0, "first waterfall row")
+    timeout = scan_timeout(win)
+    wait(lambda: np.isfinite(win.wf[0]).any(), timeout, "first completed scan row")
     snapshot = win.wf[0].copy()
     base = waterfall_rows(win)
     bytes_before = len(arrived)
     target = min(base + rows, len(win.wf))
-    wait(lambda: waterfall_rows(win) >= target, 25.0,
+    wait(lambda: waterfall_rows(win) >= target, (rows + 1) * timeout,
          f"{rows} new waterfall rows")
     check(len(arrived) > bytes_before,
           "warmup rows must be driven by serial bytes")
@@ -482,6 +495,8 @@ def step_frame_renders(win: MainWindow, shots) -> None:
         win._render()
     check(finite_frac(win.cur) > 0.05, "cur must cover >5% of the band")
     check(np.isfinite(win.peak).any(), "peak hold must accumulate")
+    wait(lambda: np.isfinite(win.wf[0]).any(), scan_timeout(win),
+         "waterfall after first completed scan")
     check(np.isfinite(win.wf[0]).any(), "waterfall must receive a row")
     peak_cells = [cell_text(win, r, 3)
                   for r in range(win.ch_table.rowCount())]
@@ -738,6 +753,35 @@ def step_settings_nondefault(win: MainWindow, shots, writes) -> None:
     print("[ok] nondefault dwell/attempt Apply + display-only isolation")
 
 
+def step_settings_fit(win: MainWindow, shots) -> None:
+    """New settings plus Apply/Reset stay on screen at both target sizes."""
+    scroll = win.findChild(QScrollArea)
+    if not isinstance(scroll, QScrollArea):
+        raise HarnessError("sidebar scroll area missing")
+    names = ("dwell_spin", "attempts_spin", "fps_spin", "hist_spin",
+             "agg_spin", "apply_btn", "reset_settings_btn")
+    for width, height in ((1480, 940), (1280, 720)):
+        win.resize(width, height)
+        APP.processEvents()
+        check((win.width(), win.height()) == (width, height),
+              f"window must be {width}x{height}, "
+              f"got {win.width()}x{win.height()}")
+        scroll.verticalScrollBar().setValue(0)
+        APP.processEvents()
+        viewport = scroll.viewport()
+        for name in names:
+            control = getattr(win, name)
+            rect = control.rect().translated(
+                control.mapTo(viewport, QPoint(0, 0)))
+            check(control.isVisible() and viewport.rect().contains(rect),
+                  f"{name} clipped at {width}x{height}")
+        if shots:
+            shot(win, shots / f"settings-{width}x{height}.png")
+    win.resize(1480, 940)
+    APP.processEvents()
+    print("[ok] settings and Apply/Reset fit 1480x940 and 1280x720")
+
+
 def run_harness(port: str, baud: int, shots_dir: str | None,
                 ready_timeout: float) -> int:
     from pathlib import Path
@@ -767,6 +811,7 @@ def run_harness(port: str, baud: int, shots_dir: str | None,
     SerialReader.write = observing_write  # type: ignore[method-assign]
 
     steps = [
+        ("settings fit", lambda: step_settings_fit(win, shots)),
         ("demo baseline", lambda: step_demo_baseline(win, shots)),
         ("connect", lambda: step_connect(win)),
         ("rf ready", lambda: step_rf_ready(win, shots, ready_timeout)),

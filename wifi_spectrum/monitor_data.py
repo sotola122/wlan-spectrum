@@ -174,6 +174,7 @@ class MonitorState:
         self.util_samples: dict[int, dict] = {}   # ch -> published util
         self.util_stage: dict[int, dict] = {}     # cycle stage, bounded
         self.util_history: dict[int, list] = {}   # ch -> bounded visits
+        self._util_history_gaps: set[int] = set()  # pending Sweep continuity breaks
         self._util_cycle: dict[int, int] = {}     # ch -> measured cycle
         self._util_stage_cycle: int | None = None
         self.rf_stage: dict[int, SpectrumRf] = {}
@@ -231,6 +232,14 @@ class MonitorState:
             self._util_stage_cycle = cycle
             return True
         if cycle > self._util_stage_cycle:
+            if self.mode == 1 and (
+                    self._last_cycle != self._util_stage_cycle
+                    or cycle > self._util_stage_cycle + 1):
+                observed = (set(self.util_stage)
+                            if cycle == self._util_stage_cycle + 1 else set())
+                # Do not mutate the published Sweep average before its
+                # marker. Break only affected histories when next published.
+                self._util_history_gaps.update(set(self.util_history) - observed)
             self.util_stage.clear()               # stale older stage
             if self.mode == 0:
                 # lost marker: the superseded cycle is closed here, so
@@ -246,6 +255,15 @@ class MonitorState:
             return True
         return cycle == self._util_stage_cycle
 
+    def _current_cycle(self, cycle: int) -> bool:
+        """A late frame/marker/error cannot roll any active stream back."""
+        if self._last_cycle is not None and cycle <= self._last_cycle:
+            return False
+        marks = [c for c in (self._coverage_cycle, self._staging_cycle,
+                             self._util_stage_cycle, self._rf_stage_cycle)
+                 if c is not None]
+        return not marks or cycle >= max(marks)
+
     def _publish_util(self, ch: int, sample: dict, cycle: int) -> None:
         """One replacement: the latest raw sample stays distinct from the
         bounded visit history. The history records each cycle's
@@ -253,6 +271,9 @@ class MonitorState:
         cycle never double count) with its arrival time for the span
         readout."""
         self.util_samples[ch] = sample
+        if ch in self._util_history_gaps:
+            self.util_history.pop(ch, None)
+            self._util_history_gaps.discard(ch)
         hist = self.util_history.setdefault(ch, [])
         if hist and hist[-1][0] == cycle:
             # same-cycle duplicate/heartbeat: refresh THIS visit's
@@ -271,6 +292,7 @@ class MonitorState:
         AND its history (missing is a gap, never a stale average)."""
         self.util_samples.pop(ch, None)
         self.util_history.pop(ch, None)
+        self._util_history_gaps.discard(ch)
         self._util_cycle.pop(ch, None)
 
     def _clear_measurements(self) -> None:
@@ -290,6 +312,7 @@ class MonitorState:
         self.util_samples.clear()   # no utilization across an epoch/band
         self.util_stage.clear()
         self.util_history.clear()
+        self._util_history_gaps.clear()
         self._util_cycle.clear()
         self._util_stage_cycle = None
         self.elapsed_ms = None
@@ -342,6 +365,7 @@ class MonitorState:
             self.util_samples.clear()
             self.util_stage.clear()
             self.util_history.clear()
+            self._util_history_gaps.clear()
             self._util_cycle.clear()
         return True
 
@@ -401,7 +425,7 @@ class MonitorState:
         if (not self.rf_ready or frame.epoch != self.epoch
                 or frame.band != self.band):
             return False
-        if self._last_cycle is not None and frame.cycle <= self._last_cycle:
+        if not self._current_cycle(frame.cycle):
             return False
         if not self._rf_coherent(frame):
             return False
@@ -414,6 +438,7 @@ class MonitorState:
             # a duplicate replaces instead of growing the stage
             self.rf_stage[frame.channel] = frame
             return False
+        self._rf_stage_cycle = frame.cycle
         return True
 
     def _rf_coherent(self, frame: SpectrumRf) -> bool:
@@ -466,17 +491,7 @@ class MonitorState:
             raise ValueError("channel event requires integer cycle")
         if not 0 <= cycle <= 0xFFFFFFFF:
             raise ValueError("channel cycle out of uint32 range")
-        # A replay at or below the last completed cycle is late/duplicate:
-        # accepting it would resurrect values the bookkeeping superseded.
-        if self._last_cycle is not None and cycle <= self._last_cycle:
-            return False
-        # Stale scope rejection BEFORE any side effect: a late older-cycle
-        # observation after a newer cycle was seen must not poison the
-        # newer coverage/staging (coverage is mutated only for cycles at
-        # or above every known high-water mark).
-        marks = [c for c in (self._coverage_cycle, self._staging_cycle,
-                             self._util_stage_cycle) if c is not None]
-        if marks and cycle < max(marks):
+        if not self._current_cycle(cycle):
             return False
         observation = decode_channel(data)
         dropped = data.get("ap_dropped", 0)
@@ -536,7 +551,7 @@ class MonitorState:
             raise ValueError("cycle id out of uint32 range")
         # Serial delivers cycles in order within an epoch: a id <= the
         # highest accepted one is a duplicate or a stale replay.
-        if self._last_cycle is not None and cycle <= self._last_cycle:
+        if not self._current_cycle(cycle):
             return False
         self._last_cycle = cycle
         self.rf_flushed = []              # consume-once per accepted marker
@@ -564,27 +579,21 @@ class MonitorState:
                 self.rf_flushed = list(self.rf_stage.values())
             self.rf_stage.clear()
         self._rf_stage_cycle = None
-        # util retention (item 1): this marker closes cycle `cycle`'s
-        # coverage. Staged values of THIS cycle replace their channel;
-        # any published value not measured during the closed cycle is
-        # truly missing and expires (missing never survives closure).
-        # An OLDER marker never replaces newer staged/published state.
-        # The cycle id stays the scope HIGH-WATER mark (never reset to
-        # None): lost-marker jumps stay detectable by _util_scope.
+        # _current_cycle already rejected an older marker. This marker
+        # closes its own cycle: Sweep publishes that cycle's stage, and
+        # any published value not measured in the closed cycle expires.
+        # The cycle id stays the scope high-water mark (never reset to
+        # None) so a lost-marker jump stays visible to _util_scope.
+        if self.mode == 1 and self._util_stage_cycle == cycle:
+            for ch, staged_sample in self.util_stage.items():
+                self._publish_util(ch, staged_sample, cycle)
+        self.util_stage.clear()
         if (self._util_stage_cycle is not None
-                and cycle < self._util_stage_cycle):
-            pass                        # older marker: state stays intact
-        else:
-            if self._util_stage_cycle == cycle:
-                for ch, staged_sample in self.util_stage.items():
-                    self._publish_util(ch, staged_sample, cycle)
-            self.util_stage.clear()
-            if (self._util_stage_cycle is not None
-                    and cycle > self._util_stage_cycle):
-                self._util_stage_cycle = cycle
-            for ch in [c for c in self.util_samples
-                       if self._util_cycle.get(c) != cycle]:
-                self._retire_util(ch)   # closed-cycle missing coverage
+                and cycle > self._util_stage_cycle):
+            self._util_stage_cycle = cycle
+        for ch in [c for c in self.util_samples
+                   if self._util_cycle.get(c) != cycle]:
+            self._retire_util(ch)   # closed-cycle missing coverage
         self.elapsed_ms = data.get("elapsed_ms")
         self.uptime_ms = data.get("uptime_ms")
         return True
@@ -596,16 +605,21 @@ class MonitorState:
         code = str(data.get("code", "unknown"))
         if type(ch) is not int:
             raise ValueError("channel_error without channel")
-        # high-water guard runs FIRST: an older cycle's error can never
-        # invalidate newer util; a newer/unknown cycle may (and starts a
-        # fresh scope via _util_scope before the pops)
         cycle = data.get("cycle")
-        if type(cycle) is not int or self._util_scope(cycle):
+        if type(cycle) is not int or not 0 <= cycle <= 0xFFFFFFFF:
+            raise ValueError("channel_error requires uint32 cycle")
+        if not self._current_cycle(cycle):
+            return False
+        error = f"ch {ch}: {code}"
+        changed = (ch not in self.unavailable or self.last_error != error
+                   or ch in self.util_samples or ch in self.util_stage)
+        if code != "spectrum_capture" and self._util_scope(cycle):
             # a failed dwell invalidates that channel's util NOW - staged
             # or published - so a failed channel cannot retain old percent
+            # FFT capture runs AFTER the channel/CCA observation and its
+            # failure does not invalidate that independent measurement.
             self.util_stage.pop(ch, None)
             self._retire_util(ch)
-        self.last_error = f"ch {ch}: {code}"
-        already = ch in self.unavailable
+        self.last_error = error
         self.unavailable.add(ch)
-        return not already
+        return changed

@@ -123,7 +123,7 @@ The UI identifies this source as sampled PHY CCA (experimental). Tooltips expose
 
 The aggregation setting uses the latest 1–16 valid visits per channel, with a default of four; one selects the latest raw ratio. Aggregate metadata identifies the contributing visit count and time span. Invalid or missing measurements clear that channel's history instead of treating failure as idle. Epoch, band and source changes clear the histories.
 
-Live replaces individual channels as observations arrive and retains other channels' last measurements while the next traversal is in progress. Starting a new cycle does not clear the whole chart. A known invalid/error result clears its channel; cycle closure removes unobserved channels, and advancing past a lost marker expires missing observations from that incomplete cycle. Sweep publishes staged results atomically at cycle completion. Retained results are last measurements, not evidence of continuous reception.
+Live replaces individual channels as observations arrive and retains other channels' last measurements while the next traversal is in progress. Starting a new cycle does not clear the whole chart. A known invalid CCA result or failed receive dwell clears its channel; an FFT-only `spectrum_capture` failure preserves valid CCA data and history. Cycle closure removes unobserved channels, and advancing past a lost marker expires missing observations from that incomplete cycle. Sweep publishes staged results atomically at cycle completion and breaks aggregation history across known missing channel visits. Retained results are last measurements, not evidence of continuous reception.
 Increasing the aggregate visit count changes the display's temporal averaging, not the physical integration window or accuracy. Increasing dwell alone does not add CCA windows; the configured attempt count controls that target.
 Capability availability means that the implementation supports this path, not that every window is valid.
 
@@ -136,6 +136,11 @@ The [RF frame contract](tlv-protocol.md#35-0x04-spectrum_rf-device--pc) defines 
 The firmware subtracts each snapshot's complex I/Q mean before windowing and FFT. This removes the DC component that otherwise produces a peak at every tuned channel center. It also suppresses a genuine exact-center component and changes the adjacent Hann-window bins; this is not absolute RF calibration or a method for measuring an exact-center continuous-wave tone.
 The GUI resamples bins within each captured span onto the shared frequency grid; it does not infer measurements outside those spans.
 Current and waterfall use the real FFT data; peak hold intentionally retains historical maxima until reset.
+In both Live and Sweep, Waterfall publishes exactly one row per accepted cycle
+marker. Live updates the spectrum immediately but leaves Waterfall unchanged
+until scan completion. Only that cycle's captured coverage enters its row;
+missing regions remain gaps. Old frames, markers and channel errors cannot
+roll a newer scan back or clear its display.
 Coverage and Sweep staging are tied to epoch and cycle IDs, not Demo's end-frequency heuristic.
 Acquisition controls follow device capabilities, while peak hold, waterfall, zoom and range controls remain available.
 Utilization uses the separate sampled PHY counters above; it is not inferred from the FFT or received packet count.
@@ -156,6 +161,8 @@ Malformed or CRC-invalid CONFIG never changes active settings; invalid-input rep
 A `channel_error` adds `epoch`, `cycle`, `band`, `ch`, and `code`.
 A failed observation is not reported as zero packets or a made-up RSSI.
 `spectrum_capture` reports a failed I/Q capture or FFT; no substitute RF frame is emitted.
+It occurs after the channel observation and does not invalidate that observation's
+independent CCA counters or their aggregation history.
 NVS initialization failure is reported without automatically erasing NVS.
 
 ## Allocation and transport

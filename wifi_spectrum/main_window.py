@@ -263,9 +263,11 @@ class MainWindow(QMainWindow):
     def _build_topbar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("topbar")
-        bar.setFixedHeight(64)
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(20, 0, 20, 0)
+        rows = QVBoxLayout(bar)
+        rows.setContentsMargins(20, 8, 20, 8)
+        rows.setSpacing(8)
+        lay = QHBoxLayout()
+        rows.addLayout(lay)
         lay.setSpacing(8)
 
         dot = QLabel("●")
@@ -319,6 +321,13 @@ class MainWindow(QMainWindow):
         self.sweep_lbl.setFixedHeight(20)
         lay.addWidget(self.sweep_lbl)
 
+        lay.addStretch(1)
+
+        # Separate connection controls rather than imposing a 1354px
+        # minimum window width that clips the sidebar on smaller screens.
+        lay = QHBoxLayout()
+        lay.setSpacing(8)
+        rows.addLayout(lay)
         lay.addStretch(1)
 
         self.demo_btn = QPushButton("Demo")
@@ -444,8 +453,8 @@ class MainWindow(QMainWindow):
         gl.addWidget(full)
         lay.addWidget(g, 1)
 
-        # acquisition (placeholders, sent to the device as CONFIG)
-        g = QGroupBox("ACQUISITION  ·  PROVISIONAL")
+        # FFT acquisition options, bound to the device's advertised caps.
+        g = QGroupBox("ACQUISITION")
         fl = QFormLayout(g)
         fl.setVerticalSpacing(10)
         self.fft_combo = QComboBox()
@@ -495,6 +504,7 @@ class MainWindow(QMainWindow):
         self.dwell_spin.setRange(0, 2000)
         self.dwell_spin.setSingleStep(10)
         self.dwell_spin.setSpecialValueText("Auto")
+        self.dwell_spin.setSuffix(" ms")
         self.dwell_spin.setFixedWidth(104)
         fl.addRow("Dwell", self.dwell_spin)
         self.attempts_spin = QSpinBox()
@@ -518,8 +528,13 @@ class MainWindow(QMainWindow):
         self.agg_spin.setRange(1, 16)
         self.agg_spin.setValue(4)
         self.agg_spin.setSpecialValueText("Raw")
+        self.agg_spin.setSuffix(" scans")
+        self.agg_spin.setToolTip(
+            "Display sum(busy) / sum(total) over the selected number of "
+            "valid channel visits. Raw uses the latest visit. This is "
+            "display averaging, not a continuous whole-scan measurement.")
         self.agg_spin.setFixedWidth(104)
-        fl.addRow("Util visits", self.agg_spin)
+        fl.addRow("Util average", self.agg_spin)
         buttons = QVBoxLayout()
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.clicked.connect(self._send_config)
@@ -536,7 +551,9 @@ class MainWindow(QMainWindow):
         self.attempts_spin.valueChanged.connect(
             lambda v: self._persist("cca_attempts", v))
         self._load_settings()
-        lay.addWidget(g)
+        # Primary settings must be visible on first launch, not buried
+        # below the channel table and display controls in a long scroll.
+        lay.insertWidget(0, g)
 
         # dB range
         g = QGroupBox("dB RANGE")
@@ -1134,7 +1151,6 @@ class MainWindow(QMainWindow):
         if not self.monitor_state.accept_rf(msg):
             return                   # stale epoch/band or a closed cycle
         self._rf_apply_frames([msg])
-        self._push_row()             # live: one waterfall row per frame
 
     def _sync_util_from_state(self) -> None:
         """Rebuild the display map from MonitorState's published set:
@@ -1192,8 +1208,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self.statusBar().showMessage(f"Rejected monitor payload: {exc}")
             return
-        if not changed and event != "channel_error":
-            # a repeated channel error still invalidates published util
+        if not changed:
             return
         if event == "config":
             self._cfg_timer.stop()   # fresh matching ack cancels the chain
@@ -1224,11 +1239,10 @@ class MainWindow(QMainWindow):
                 self._rf_apply_frames(flushed)
             # Close/mask the cycle BEFORE copying into waterfall history,
             # so a row never contains another cycle's leftover values.
-            self._rf_close_cycle()
-            if flushed or self.mode == MODE_SWEEP:
-                # exactly one history row per completed sweep cycle - an
-                # all-NaN row honestly records a cycle with no captures
-                self._push_row()
+            self._rf_close_cycle(data["cycle"])
+            # Both modes publish one waterfall row per completed scan.
+            # An all-NaN row honestly records a cycle with no captures.
+            self._push_row()
 
     def _sync_rf_state(self, old_epoch: int | None) -> None:
         """Re-derive RF mode from the current ack and clear every buffer
@@ -1293,9 +1307,11 @@ class MainWindow(QMainWindow):
             self._rf_close_cycle()
             self._rf_cycle = cycle
 
-    def _rf_close_cycle(self) -> None:
+    def _rf_close_cycle(self, cycle: int | None = None) -> None:
         # Channels without a frame in the closing cycle become gaps:
         # no zero-fill, no interpolation, no synthetic floor.
+        if cycle is not None and cycle != self._rf_cycle:
+            self._rf_covered[:] = False  # no captures belonging to this marker
         self.cur[~self._rf_covered] = np.nan
         self._rf_covered[:] = False
         self._rf_cycle = None
