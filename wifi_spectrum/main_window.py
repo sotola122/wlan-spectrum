@@ -41,6 +41,7 @@ from .mock import MODE_LIVE, MODE_SWEEP, MockSource
 from .monitor_data import SCHEMA as MONITOR_SCHEMA
 from .monitor_data import UTIL_CONFIDENCE, UTIL_SOURCE, MonitorState
 from .serial_link import SerialReader, available_ports
+from .spectrum_smooth import smooth_frequency_bins
 from .theme import C
 
 theme.configure_pyqtgraph()
@@ -175,6 +176,7 @@ class MainWindow(QMainWindow):
     SETTINGS_DEFAULTS = {"fps": 30, "history_rows": 200,
                          "aggregation": 4, "channel_dwell_ms": 0,
                          "cca_attempts": 16,
+                         "spectrum_smooth": 0, "spectrum_smooth_bins": 5,
                          # existing acquisition knobs (same saved set)
                          "mode": 0, "band": 0, "sweep_ms": 1000,
                          "fft_size": 64, "sample_rate_khz": 20000}
@@ -216,6 +218,8 @@ class MainWindow(QMainWindow):
         self._cell_writes = 0
         self._brush_cache: dict[float, object] = {}
         self._util_label_last: dict[int, str] = {}
+        self._spectrum_smooth = False
+        self._spectrum_smooth_bins = self.SETTINGS_DEFAULTS["spectrum_smooth_bins"]
         # Debounced acquisition apply (item 5): widget edits coalesce into
         # ONE CONFIG after the last change instead of resetting the device
         # mid-edit; the Apply button sends immediately.
@@ -263,12 +267,10 @@ class MainWindow(QMainWindow):
     def _build_topbar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("topbar")
-        rows = QVBoxLayout(bar)
-        rows.setContentsMargins(20, 8, 20, 8)
-        rows.setSpacing(8)
-        lay = QHBoxLayout()
-        rows.addLayout(lay)
-        lay.setSpacing(8)
+        bar.setFixedHeight(64)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(16, 0, 16, 0)
+        lay.setSpacing(6)
 
         dot = QLabel("●")
         dot.setObjectName("brandDot")
@@ -295,7 +297,7 @@ class MainWindow(QMainWindow):
         self.play_btn = QPushButton("▶  Start")
         self.play_btn.setObjectName("primary")
         self.play_btn.setCheckable(True)
-        self.play_btn.setMinimumWidth(92)
+        self.play_btn.setMinimumWidth(84)
         self.play_btn.toggled.connect(self._on_play_toggled)
         lay.addWidget(self.play_btn)
 
@@ -304,7 +306,7 @@ class MainWindow(QMainWindow):
         self.sweep_time.setSingleStep(100)
         self.sweep_time.setValue(1000)
         self.sweep_time.setSuffix(" ms")
-        self.sweep_time.setFixedWidth(104)
+        self.sweep_time.setFixedWidth(96)
         self.sweep_time.valueChanged.connect(self._schedule_config)
         self.sweep_time.valueChanged.connect(
             lambda v: self._persist("sweep_ms", v))
@@ -313,7 +315,7 @@ class MainWindow(QMainWindow):
         self.sweep_count = QSpinBox()
         self.sweep_count.setRange(0, 9999)
         self.sweep_count.setSpecialValueText("∞")
-        self.sweep_count.setFixedWidth(76)
+        self.sweep_count.setFixedWidth(72)
         self.sweep_count.valueChanged.connect(self._update_sweep_label)
         lay.addWidget(_labeled("Count", self.sweep_count))
         self.sweep_lbl = QLabel("0 / ∞")
@@ -321,13 +323,6 @@ class MainWindow(QMainWindow):
         self.sweep_lbl.setFixedHeight(20)
         lay.addWidget(self.sweep_lbl)
 
-        lay.addStretch(1)
-
-        # Separate connection controls rather than imposing a 1354px
-        # minimum window width that clips the sidebar on smaller screens.
-        lay = QHBoxLayout()
-        lay.setSpacing(8)
-        rows.addLayout(lay)
         lay.addStretch(1)
 
         self.demo_btn = QPushButton("Demo")
@@ -338,10 +333,15 @@ class MainWindow(QMainWindow):
         lay.addWidget(_vsep())
 
         self.port_combo = QComboBox()
-        self.port_combo.setFixedWidth(124)
+        self.port_combo.setFixedWidth(108)
         self.port_combo.setEditable(True)        # COM3, /dev/ttyUSB0, or a Linux pty path
         self.port_combo.setPlaceholderText("COM port")
-        self.port_combo.setToolTip("Serial port (Windows: COM3; Linux: /dev/ttyUSB0 or /dev/ttyACM0)")
+        port_tip = ("Serial port (Windows: COM3; Linux: /dev/ttyUSB0 "
+                    "or /dev/ttyACM0)")
+        self.port_combo.setToolTip(port_tip)
+        self.port_combo.currentTextChanged.connect(
+            lambda text: self.port_combo.setToolTip(
+                text if text else port_tip))
         lay.addWidget(self.port_combo)
         refresh = QPushButton("⟳")
         refresh.setObjectName("icon")
@@ -351,12 +351,12 @@ class MainWindow(QMainWindow):
         self.baud_combo = QComboBox()
         self.baud_combo.addItems(["115200", "460800", "921600", "2000000"])
         self.baud_combo.setCurrentText("921600")
-        self.baud_combo.setFixedWidth(100)
+        self.baud_combo.setFixedWidth(92)
         lay.addWidget(self.baud_combo)
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setObjectName("primary")
         self.connect_btn.setCheckable(True)
-        self.connect_btn.setMinimumWidth(80)
+        self.connect_btn.setMinimumWidth(72)
         self.connect_btn.toggled.connect(self._on_connect_toggled)
         lay.addWidget(self.connect_btn)
         self._refresh_ports()
@@ -499,14 +499,17 @@ class MainWindow(QMainWindow):
         # acquisition pair (dwell/attempts) goes out through Apply
         g = QGroupBox("SETTINGS")
         fl = QFormLayout(g)
-        fl.setVerticalSpacing(10)
-        self.dwell_spin = QSpinBox()
-        self.dwell_spin.setRange(0, 2000)
-        self.dwell_spin.setSingleStep(10)
-        self.dwell_spin.setSpecialValueText("Auto")
-        self.dwell_spin.setSuffix(" ms")
-        self.dwell_spin.setFixedWidth(104)
-        fl.addRow("Dwell", self.dwell_spin)
+        fl.setVerticalSpacing(8)
+        self.dwell_mode_combo = QComboBox()
+        self.dwell_mode_combo.addItems(["Auto", "Manual"])
+        self.dwell_mode_combo.setFixedWidth(104)
+        fl.addRow("Dwell", self.dwell_mode_combo)
+        self.dwell_ms_spin = QSpinBox()
+        self.dwell_ms_spin.setRange(120, 2000)
+        self.dwell_ms_spin.setSingleStep(10)
+        self.dwell_ms_spin.setSuffix(" ms")
+        self.dwell_ms_spin.setFixedWidth(104)
+        fl.addRow("Dwell time", self.dwell_ms_spin)
         self.attempts_spin = QSpinBox()
         self.attempts_spin.setRange(1, 32)
         self.attempts_spin.setValue(16)
@@ -524,17 +527,40 @@ class MainWindow(QMainWindow):
         self.hist_spin.setSuffix(" rows")
         self.hist_spin.setFixedWidth(104)
         fl.addRow("WF history", self.hist_spin)
-        self.agg_spin = QSpinBox()
-        self.agg_spin.setRange(1, 16)
-        self.agg_spin.setValue(4)
-        self.agg_spin.setSpecialValueText("Raw")
-        self.agg_spin.setSuffix(" scans")
-        self.agg_spin.setToolTip(
-            "Display sum(busy) / sum(total) over the selected number of "
-            "valid channel visits. Raw uses the latest visit. This is "
-            "display averaging, not a continuous whole-scan measurement.")
-        self.agg_spin.setFixedWidth(104)
-        fl.addRow("Util average", self.agg_spin)
+        self.util_mode_combo = QComboBox()
+        self.util_mode_combo.addItems(["Raw", "Average"])
+        self.util_mode_combo.setCurrentIndex(1)
+        self.util_mode_combo.setFixedWidth(104)
+        self.util_mode_combo.setToolTip(
+            "Raw shows the latest valid visit. Average combines recent "
+            "visits with sum(busy)/sum(total); not whole-dwell airtime.")
+        fl.addRow("Utilization", self.util_mode_combo)
+        self.util_visits_spin = QSpinBox()
+        self.util_visits_spin.setRange(2, 16)
+        self.util_visits_spin.setValue(4)
+        self.util_visits_spin.setSuffix(" scans")
+        self.util_visits_spin.setFixedWidth(104)
+        fl.addRow("Util visits", self.util_visits_spin)
+        self.smooth_mode_combo = QComboBox()
+        self.smooth_mode_combo.addItems(["Off", "On"])
+        self.smooth_mode_combo.setFixedWidth(104)
+        self.smooth_mode_combo.setToolTip(
+            "Display-only: arithmetic mean of adjacent dB/dBFS display bins "
+            "on the Current curve (not linear power). Gaps stay gaps. "
+            "Does not change stored measurements, peak hold, waterfall, "
+            "or utilization.")
+        fl.addRow("Spectrum smooth", self.smooth_mode_combo)
+        self.smooth_bins_spin = QSpinBox()
+        self.smooth_bins_spin.setRange(3, 31)
+        self.smooth_bins_spin.setSingleStep(2)
+        self.smooth_bins_spin.setValue(5)
+        self.smooth_bins_spin.setSuffix(" bins")
+        self.smooth_bins_spin.setToolTip(
+            "Odd count of display frequency bins in each contiguous "
+            "measured run (same grid as the spectrum plot). Even values "
+            "round up to the next odd bin count.")
+        self.smooth_bins_spin.setFixedWidth(104)
+        fl.addRow("Smooth width", self.smooth_bins_spin)
         buttons = QVBoxLayout()
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.clicked.connect(self._send_config)
@@ -545,12 +571,21 @@ class MainWindow(QMainWindow):
         fl.addRow("", buttons)
         self.fps_spin.valueChanged.connect(self._on_fps_changed)
         self.hist_spin.valueChanged.connect(self._on_hist_changed)
-        self.agg_spin.valueChanged.connect(self._on_agg_changed)
-        self.dwell_spin.valueChanged.connect(
-            lambda v: self._persist("channel_dwell_ms", v))
+        self.dwell_mode_combo.currentIndexChanged.connect(
+            self._on_dwell_mode_changed)
+        self.dwell_ms_spin.valueChanged.connect(self._on_dwell_ms_changed)
+        self.util_mode_combo.currentIndexChanged.connect(
+            self._on_util_mode_changed)
+        self.util_visits_spin.valueChanged.connect(self._on_util_visits_changed)
+        self.smooth_mode_combo.currentIndexChanged.connect(
+            self._on_smooth_mode_changed)
+        self.smooth_bins_spin.valueChanged.connect(self._on_smooth_bins_changed)
         self.attempts_spin.valueChanged.connect(
             lambda v: self._persist("cca_attempts", v))
         self._load_settings()
+        self._sync_dwell_mode_ui()
+        self._sync_util_mode_ui()
+        self._sync_smooth_ui()
         # Primary settings must be visible on first launch, not buried
         # below the channel table and display controls in a long scroll.
         lay.insertWidget(0, g)
@@ -945,12 +980,26 @@ class MainWindow(QMainWindow):
             elif key == "history_rows":
                 self.hist_spin.setValue(min(1000, max(50, value)))
             elif key == "aggregation":
-                self.agg_spin.setValue(min(16, max(1, value)))
+                if value <= 1:
+                    self.util_mode_combo.setCurrentIndex(0)
+                else:
+                    self.util_mode_combo.setCurrentIndex(1)
+                    self.util_visits_spin.setValue(min(16, max(2, value)))
             elif key == "channel_dwell_ms":
-                # 0 = Auto; a nonzero override must be a real dwell
-                if value and value < 120:
-                    value = 120
-                self.dwell_spin.setValue(min(2000, value))
+                if not value:
+                    self.dwell_mode_combo.setCurrentIndex(0)
+                else:
+                    self.dwell_mode_combo.setCurrentIndex(1)
+                    ms = max(120, min(2000, value))
+                    self.dwell_ms_spin.setValue(ms)
+            elif key == "spectrum_smooth":
+                self.smooth_mode_combo.setCurrentIndex(
+                    1 if value else 0)
+            elif key == "spectrum_smooth_bins":
+                bins = min(31, max(3, value))
+                if bins % 2 == 0:
+                    bins += 1
+                self.smooth_bins_spin.setValue(bins)
             elif key == "cca_attempts":
                 self.attempts_spin.setValue(min(32, max(1, value)))
             elif key == "mode":
@@ -991,9 +1040,16 @@ class MainWindow(QMainWindow):
             f"{defaults['sample_rate_khz'] // 1000} MS/s")
         self.fps_spin.setValue(defaults["fps"])
         self.hist_spin.setValue(defaults["history_rows"])
-        self.agg_spin.setValue(defaults["aggregation"])
-        self.dwell_spin.setValue(defaults["channel_dwell_ms"])
         self.attempts_spin.setValue(defaults["cca_attempts"])
+        self.dwell_mode_combo.setCurrentIndex(0)
+        self.dwell_ms_spin.setValue(120)
+        self.util_mode_combo.setCurrentIndex(1)
+        self.util_visits_spin.setValue(defaults["aggregation"])
+        self.smooth_mode_combo.setCurrentIndex(0)
+        self.smooth_bins_spin.setValue(defaults["spectrum_smooth_bins"])
+        self._sync_dwell_mode_ui()
+        self._sync_util_mode_ui()
+        self._sync_smooth_ui()
         for key, default in defaults.items():
             self._persist(key, default)
 
@@ -1031,14 +1087,75 @@ class MainWindow(QMainWindow):
         self.wf_img.setRect(self._wf_rect)
         self.wf_plot.getViewBox().setYRange(0, new_rows, padding=0)
 
-    def _on_agg_changed(self, value: int) -> None:
-        self._persist("aggregation", value)
-        self._util_agg = int(value)
+    def _sync_dwell_mode_ui(self) -> None:
+        manual = self.dwell_mode_combo.currentIndex() == 1
+        self.dwell_ms_spin.setEnabled(manual)
+
+    def _on_dwell_mode_changed(self, *_):
+        self._sync_dwell_mode_ui()
+        self._persist_dwell_ms()
+
+    def _on_dwell_ms_changed(self, value: int) -> None:
+        if self.dwell_mode_combo.currentIndex() == 1:
+            self._persist("channel_dwell_ms", max(120, int(value)))
+
+    def _persist_dwell_ms(self) -> None:
+        if self.dwell_mode_combo.currentIndex() == 0:
+            self._persist("channel_dwell_ms", 0)
+        else:
+            self._persist("channel_dwell_ms",
+                          max(120, self.dwell_ms_spin.value()))
+
+    def _sync_util_mode_ui(self) -> None:
+        raw = self.util_mode_combo.currentIndex() == 0
+        self.util_visits_spin.setEnabled(not raw)
+        self._util_agg = (1 if raw else self.util_visits_spin.value())
+
+    def _on_util_mode_changed(self, *_):
+        self._sync_util_mode_ui()
+        self._persist("aggregation", self._util_agg)
         if self._monitor_view():
             self._sync_util_from_state()
         else:
-            self._update_util_bars()   # demo: original layout, shared
+            self._update_util_bars()
         self._sync_util_caption()
+
+    def _on_util_visits_changed(self, value: int) -> None:
+        if self.util_mode_combo.currentIndex() == 1:
+            self._util_agg = int(value)
+            self._persist("aggregation", value)
+            if self._monitor_view():
+                self._sync_util_from_state()
+            else:
+                self._update_util_bars()
+            self._sync_util_caption()
+
+    def _sync_smooth_ui(self) -> None:
+        on = self.smooth_mode_combo.currentIndex() == 1
+        self.smooth_bins_spin.setEnabled(on)
+        bins = int(self.smooth_bins_spin.value())
+        if bins % 2 == 0:
+            bins += 1
+            self.smooth_bins_spin.setValue(bins)
+        self._spectrum_smooth = on
+        self._spectrum_smooth_bins = bins
+
+    def _on_smooth_mode_changed(self, *_):
+        self._sync_smooth_ui()
+        self._persist("spectrum_smooth", int(self._spectrum_smooth))
+        self._dirty = True
+
+    def _on_smooth_bins_changed(self, value: int) -> None:
+        bins = int(value)
+        if bins % 2 == 0:
+            bins += 1
+            self.smooth_bins_spin.blockSignals(True)
+            self.smooth_bins_spin.setValue(bins)
+            self.smooth_bins_spin.blockSignals(False)
+        self._spectrum_smooth_bins = bins
+        self._persist("spectrum_smooth_bins", bins)
+        if self._spectrum_smooth:
+            self._dirty = True
 
     def _schedule_config(self, *_):
         """Debounce acquisition edits into ONE CONFIG after the last
@@ -1076,8 +1193,9 @@ class MainWindow(QMainWindow):
     def _effective_dwell_request(self) -> int:
         """channel_dwell_ms for CONFIG: 0 = Auto, otherwise a real dwell
         (the wire contract only allows 0 or 120..2000 ms)."""
-        value = int(self.dwell_spin.value())
-        return 0 if value == 0 else max(120, value)
+        if self.dwell_mode_combo.currentIndex() == 0:
+            return 0
+        return max(120, int(self.dwell_ms_spin.value()))
 
     def _retry_config(self) -> None:
         """Bounded resend of the latest CONFIG until a fresh matching ack.
@@ -1345,7 +1463,10 @@ class MainWindow(QMainWindow):
         if not self._dirty:
             return
         self._dirty = False
-        self.cur_curve.setData(self.freqs, self.cur)
+        cur_plot = self.cur
+        if self._spectrum_smooth:
+            cur_plot = smooth_frequency_bins(self.cur, self._spectrum_smooth_bins)
+        self.cur_curve.setData(self.freqs, cur_plot)
         self.peak_curve.setData(self.freqs, self.peak)
         if self.wf_chk.isChecked():
             self.wf_img.setImage(self.wf, autoLevels=False,

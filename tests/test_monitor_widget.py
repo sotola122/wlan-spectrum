@@ -12,12 +12,19 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 import unittest
 from unittest import mock
 
 import numpy as np
 from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QScrollArea,
+    QVBoxLayout,
+)
 
 from wifi_spectrum import main_window, theme, tlv
 from wifi_spectrum.bands import BANDS
@@ -109,6 +116,35 @@ def rf_blob(epoch: int = 1, cycle: int = 1, band: int = 0, ch: int = 6,
         values = [float(power[0])] * n
     return tlv.encode_spectrum_rf(epoch, cycle, band, ch, mode, 0, 0,
                                   center_khz, span_khz, values)
+
+
+def rf_spike_blob(spike_bin: int | None = None, floor: float = -50.0,
+                  spike: float = -25.0, **kwargs) -> bytes:
+    """Full-width SYNTHETIC spectrum with one interior bin spike."""
+    n = int(RF_EFF["fft_size"])
+    if spike_bin is None:
+        spike_bin = n // 2
+    power = [floor] * n
+    power[spike_bin] = spike
+    return rf_blob(power=power, **kwargs)
+
+
+def interior_smooth_probe_index(values: np.ndarray) -> int:
+    """Index where neighbors differ enough that width-5 smooth moves the plot."""
+    best_j = None
+    best_score = 0.0
+    for j in range(1, len(values) - 1):
+        if not (np.isfinite(values[j]) and np.isfinite(values[j - 1])
+                and np.isfinite(values[j + 1])):
+            continue
+        nb_mean = 0.5 * (float(values[j - 1]) + float(values[j + 1]))
+        score = abs(float(values[j]) - nb_mean)
+        if score > best_score:
+            best_score = score
+            best_j = j
+    if best_j is None or best_score < 0.5:
+        raise AssertionError("no interior bin variation for smooth probe")
+    return best_j
 
 
 def config_from_frame(blob: bytes) -> dict:
@@ -351,6 +387,75 @@ class RfRenderingTests(unittest.TestCase):
         before_duplicate = self.win.wf.copy()
         self.deliver(cycle_event(cycle=2))
         np.testing.assert_equal(self.win.wf, before_duplicate)
+
+    def test_spectrum_smooth_changes_display_not_storage(self) -> None:
+        """Frequency-bin average affects Current curve only at render time."""
+        self.ack()
+        self.win.cur[:] = -50.0
+        mid = len(self.win.cur) // 2
+        self.win.cur[mid] = -20.0
+        stored = float(self.win.cur[mid])
+        self.win.smooth_mode_combo.setCurrentIndex(0)
+        self.win._dirty = True
+        self.win._render()
+        plotted = self.win.cur_curve.getData()[1]
+        self.assertIsNotNone(plotted)
+        assert plotted is not None
+        off_plot = float(plotted[mid])
+        self.win.smooth_mode_combo.setCurrentIndex(1)
+        self.win.smooth_bins_spin.setValue(7)
+        self.win._dirty = True
+        self.win._render()
+        plotted_on = self.win.cur_curve.getData()[1]
+        self.assertIsNotNone(plotted_on)
+        assert plotted_on is not None
+        on_plot = float(plotted_on[mid])
+        self.assertEqual(float(self.win.cur[mid]), stored)
+        self.assertAlmostEqual(off_plot, stored, places=3)
+        self.assertNotAlmostEqual(on_plot, off_plot, places=1)
+        self.assertGreater(on_plot, -50.0)
+
+    def test_spectrum_smooth_rf_parser_path(self) -> None:
+        self.ack()
+        self.fx.deliver(rf_spike_blob(cycle=1, ch=6, center_khz=2437000))
+        self.deliver(cycle_event(cycle=1))
+        raw = self.win.cur.copy()
+        idx = int(np.nanargmax(raw))
+        peak_before = self.win.peak.copy()
+        wf_before = self.win.wf.copy()
+        self.win.smooth_mode_combo.setCurrentIndex(1)
+        self.win.smooth_bins_spin.setValue(5)
+        self.win._dirty = True
+        self.win._render()
+        np.testing.assert_array_equal(self.win.cur, raw)
+        np.testing.assert_array_equal(self.win.peak, peak_before)
+        np.testing.assert_array_equal(self.win.wf, wf_before)
+        plotted = self.win.cur_curve.getData()[1]
+        assert plotted is not None
+        self.assertNotAlmostEqual(float(plotted[idx]), float(raw[idx]),
+                                  places=2)
+
+    def test_spectrum_smooth_demo_path(self) -> None:
+        self.win._detach()
+        self.win.demo_btn.setChecked(True)
+        for _ in range(30):
+            time.sleep(0.06)
+            APP.processEvents()
+        self.assertTrue(np.isfinite(self.win.cur).any())
+        raw = self.win.cur.copy()
+        mid = interior_smooth_probe_index(raw)
+        wf_before = self.win.wf.copy()
+        self.win.smooth_mode_combo.setCurrentIndex(1)
+        self.win.smooth_bins_spin.setValue(5)
+        self.win._dirty = True
+        self.win._render()
+        np.testing.assert_array_equal(self.win.cur, raw)
+        np.testing.assert_array_equal(self.win.wf, wf_before)
+        plotted = self.win.cur_curve.getData()[1]
+        assert plotted is not None
+        self.assertNotAlmostEqual(float(plotted[mid]), float(raw[mid]),
+                                  places=2)
+        self.win.demo_btn.setChecked(False)
 
     def test_frame_renders_cur_peak_waterfall_and_sidebar(self) -> None:
         self.ack()
@@ -745,7 +850,7 @@ class RfRenderingTests(unittest.TestCase):
                 "busy": 0, "total": 65536, "samples": 3, "attempted": 4, "window_us_upper": 819}
         self.win.mode_tabs.setCurrentIndex(1)
         self.ack(utilization=cap)
-        self.win.agg_spin.setValue(1)     # RAW: exact per-visit cells
+        self.win.util_mode_combo.setCurrentIndex(0)  # Raw: per-visit cells
         # valid cycle0: two channels + marker0 -> published exact
         self.deliver(channel_event(ch=6, cycle=0, util=base))
         self.deliver(channel_event(ch=1, cycle=0,
@@ -1232,6 +1337,47 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
                                    "source": UTIL_SOURCE,
                                    "confidence": UTIL_CONFIDENCE})))
 
+    def test_topbar_single_row_geometry(self) -> None:
+        """Production topbar stays one row; controls fit 1280x720 and 1480x940."""
+        topbar = self.win.findChild(QFrame, "topbar")
+        self.assertIsNotNone(topbar)
+        assert topbar is not None
+        lay = topbar.layout()
+        self.assertIsInstance(
+            lay, QHBoxLayout,
+            "topbar must be a single horizontal row, not a wrapped VBox")
+        self.assertNotIsInstance(lay, QVBoxLayout)
+        controls = (
+            self.win.mode_tabs, self.win.band_seg, self.win.play_btn,
+            self.win.demo_btn, self.win.port_combo, self.win.connect_btn,
+        )
+        for width, height in ((1480, 940), (1280, 720)):
+            with self.subTest(size=(width, height)):
+                self.win.resize(width, height)
+                APP.processEvents()
+                self.assertEqual((self.win.width(), self.win.height()),
+                                 (width, height))
+                self.assertLessEqual(topbar.height(), 72,
+                                     "topbar must not grow to two rows")
+                bar = topbar.rect()
+                ys = [
+                    w.mapTo(topbar, QPoint(w.width() // 2, w.height() // 2)).y()
+                    for w in controls
+                ]
+                self.assertLess(max(ys) - min(ys), 14,
+                                "toolbar controls must share one row")
+                for w in controls:
+                    g = w.rect().translated(w.mapTo(topbar, QPoint(0, 0)))
+                    self.assertTrue(bar.contains(g),
+                                    f"{w.objectName()} clips the topbar")
+        long_port = "COM_PORT_SYNTHETIC_VERY_LONG_LABEL_EXAMPLE"
+        self.win.port_combo.addItem(long_port)
+        self.win.port_combo.setCurrentText(long_port)
+        APP.processEvents()
+        self.assertLessEqual(self.win.port_combo.width(), 108,
+                             "port field must stay bounded in one-row layout")
+        self.assertIn("SYNTHETIC", self.win.port_combo.toolTip())
+
     def test_added_settings_visible_without_scrolling(self) -> None:
         for width, height in ((1480, 940), (1280, 720)):
             with self.subTest(size=(width, height)):
@@ -1245,9 +1391,11 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
                 assert scroll is not None
                 scroll.verticalScrollBar().setValue(0)
                 viewport = scroll.viewport()
-                for name in ("dwell_spin", "attempts_spin", "fps_spin",
-                             "hist_spin", "agg_spin", "apply_btn",
-                             "reset_settings_btn"):
+                for name in ("dwell_mode_combo", "dwell_ms_spin",
+                             "attempts_spin", "fps_spin", "hist_spin",
+                             "util_mode_combo", "util_visits_spin",
+                             "smooth_mode_combo", "smooth_bins_spin",
+                             "apply_btn", "reset_settings_btn"):
                     control = getattr(self.win, name)
                     rect = control.rect().translated(
                         control.mapTo(viewport, QPoint(0, 0)))
@@ -1272,7 +1420,8 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
 
     def test_aggregate_sum_over_visits_with_raw_metadata(self) -> None:
         self.util_ack()
-        self.win.agg_spin.setValue(2)
+        self.win.util_mode_combo.setCurrentIndex(1)
+        self.win.util_visits_spin.setValue(2)
         self.win._on_monitor_status(channel_event(
             cycle=1, ch=6, util=self.util(500)))
         self.win._on_monitor_status(channel_event(
@@ -1286,7 +1435,7 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
         self.assertIn("sum busy 500 / sum total 2000", tip)  # aggregates
         self.assertIn("2 visits", tip)
         # raw option: exactly the latest measurement, no averaging
-        self.win.agg_spin.setValue(1)
+        self.win.util_mode_combo.setCurrentIndex(0)
         self.win._sync_util_from_state()
         self.assertEqual(cell_text(self.win.ch_table, row, 2), "0 %")
 
@@ -1319,6 +1468,36 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
                 self.assertEqual(cell_text(self.win.ch_table, row, 2), "50 %")
                 self.assertAlmostEqual(np.asarray(self.win.util_bars.opts["height"])[row], 50.0)
 
+    def test_smooth_role_settings_persist_reload_reset(self) -> None:
+        store = FakeSettings({"spectrum_smooth": 1, "spectrum_smooth_bins": 6,
+                              "channel_dwell_ms": 300, "aggregation": 8})
+        win = MainWindow(settings=store)
+        win.show()
+        APP.processEvents()
+        try:
+            self.assertEqual(win.smooth_mode_combo.currentIndex(), 1)
+            self.assertEqual(win.smooth_bins_spin.value(), 7)
+            self.assertTrue(win.smooth_bins_spin.isEnabled())
+            self.assertEqual(win.dwell_mode_combo.currentIndex(), 1)
+            self.assertEqual(win.dwell_ms_spin.value(), 300)
+            self.assertTrue(win.dwell_ms_spin.isEnabled())
+            self.assertEqual(win.util_mode_combo.currentIndex(), 1)
+            self.assertEqual(win.util_visits_spin.value(), 8)
+            self.assertTrue(win.util_visits_spin.isEnabled())
+            win.smooth_bins_spin.setValue(4)
+            win._on_smooth_bins_changed(4)
+            self.assertEqual(win.smooth_bins_spin.value(), 5)
+            win.reset_settings_btn.click()
+            self.assertEqual(win.smooth_mode_combo.currentIndex(), 0)
+            self.assertFalse(win.smooth_bins_spin.isEnabled())
+            self.assertEqual(win.dwell_mode_combo.currentIndex(), 0)
+            self.assertFalse(win.dwell_ms_spin.isEnabled())
+            self.assertEqual(win.util_mode_combo.currentIndex(), 1)
+            self.assertEqual(win.util_visits_spin.value(), 4)
+        finally:
+            win.close()
+            APP.processEvents()
+
     def test_settings_clamp_reset_apply_and_persistence(self) -> None:
         store = FakeSettings({"fps": 999, "history_rows": 10,
                               "aggregation": 99, "channel_dwell_ms": 50,
@@ -1332,8 +1511,10 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
         try:
             self.assertEqual(win.fps_spin.value(), 60)
             self.assertEqual(win.hist_spin.value(), 50)
-            self.assertEqual(win.agg_spin.value(), 16)
-            self.assertEqual(win.dwell_spin.value(), 120)  # clamped >=120
+            self.assertEqual(win.util_mode_combo.currentIndex(), 1)
+            self.assertEqual(win.util_visits_spin.value(), 16)
+            self.assertEqual(win.dwell_mode_combo.currentIndex(), 1)
+            self.assertEqual(win.dwell_ms_spin.value(), 120)
             self.assertEqual(win.attempts_spin.value(), 32)
             self.assertEqual(win._render_timer.interval(), 1000 // 60)
             # saved acquisition knobs restore (validated/clamped)
@@ -1354,8 +1535,10 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
             self.assertEqual(win.sr_combo.currentText(), "20 MS/s")
             self.assertEqual(win.fps_spin.value(), 30)
             self.assertEqual(win.hist_spin.value(), 200)
-            self.assertEqual(win.agg_spin.value(), 4)
-            self.assertEqual(win.dwell_spin.value(), 0)
+            self.assertEqual(win.util_mode_combo.currentIndex(), 1)
+            self.assertEqual(win.util_visits_spin.value(), 4)
+            self.assertEqual(win.dwell_mode_combo.currentIndex(), 0)
+            self.assertEqual(win.smooth_mode_combo.currentIndex(), 0)
             self.assertEqual(win.attempts_spin.value(), 16)
             self.assertEqual(store.data.get("mode"), 0)
             self.assertEqual(store.data.get("band"), 0)
@@ -1372,7 +1555,8 @@ class SettingsAggregationRetentionTests(unittest.TestCase):
         self.win.fps_spin.setValue(25)          # display-only: no CONFIG
         self.assertEqual(len(self.fx.writes), writes)
         self.win.attempts_spin.setValue(7)
-        self.win.dwell_spin.setValue(300)
+        self.win.dwell_mode_combo.setCurrentIndex(1)
+        self.win.dwell_ms_spin.setValue(300)
         self.win.apply_btn.click()
         self.assertEqual(len(self.fx.writes), writes + 1)
         sent = config_from_frame(self.fx.writes[-1])

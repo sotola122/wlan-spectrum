@@ -133,17 +133,28 @@ Mouse wheel / drag zooms and pans the frequency axis on all three plots together
 ### Measurement and display settings
 
 The **SETTINGS** group is at the top of the right sidebar, with the new controls
-and Apply visible without scrolling at 1280×720. Connection controls occupy a
-separate toolbar row so they do not force the sidebar beyond the window width.
+and Apply / Reset defaults visible without scrolling at 1280×720.
+Acquisition and connection controls share a single toolbar row.
+Choose modes from dropdowns and enter quantities in numeric fields; fields that
+do not apply to the selected mode are disabled.
 Measurement settings change device acquisition; display settings do not send CONFIG.
 
 | Setting | Range / default | Meaning |
 |---|---|---|
-| Channel dwell | Auto, or 120–2000 ms; default Auto | Requested receive time per channel; the effective target also reserves 5 ms per CCA attempt |
+| Dwell / Dwell time | Auto or Manual; Manual uses 120–2000 ms; default Auto | Requested receive time per channel; the effective target also reserves 5 ms per CCA attempt |
 | CCA attempts | 1–32; default 16 | Target short PHY-counter windows distributed across a dwell; invalid or missed windows are reported, not invented |
 | Display refresh | 5–60 FPS; default 30 | Repaint rate, not the measurement or serial receive rate |
 | Waterfall history | 50–1000 rows; default 200 | Retained display history |
-| Util average | 1–16 scans; default 4 | Counter-weighted aggregation of recent valid visits per channel; Raw shows the latest result |
+| Utilization / Util visits | Raw or Average; Average uses 2–16 visits; default Average, 4 | Counter-weighted aggregation of recent valid visits per channel; Raw shows the latest result |
+| Spectrum smooth / Smooth width | Off or On; odd widths of 3–31 display bins; default Off, width 5 | Frequency-axis moving average of the blue Current curve only |
+
+To smooth the spectrum, select **On** in **Spectrum smooth** and enter a
+**Smooth width**. The centered window averages the displayed dBm or dBFS values
+arithmetically within each continuous measured region, shortening at its edges.
+Missing regions stay gaps and are not averaged across. The width counts bins on
+the display frequency grid, not raw FFT bins. This is visual smoothing, not
+linear-power averaging, temporal averaging, normalization, or improved RF accuracy.
+Raw measurements, Peak Hold, Waterfall and channel utilization are unchanged.
 
 Live retains the last result for other channels while the next scan visits them.
 Invalid measurements and channels missing from a completed cycle remain unavailable,
@@ -160,11 +171,13 @@ confirmed missing coverage. Late older-cycle frames and markers are ignored.
 Click **Apply** to send the selected dwell and CCA-attempt settings. Changes to
 FFT size, sample rate and Sweep time are sent after a short editing pause;
 each request includes all seven selected acquisition fields.
-Display refresh, history and aggregation changes take effect locally without CONFIG.
+Display refresh, history, aggregation and spectrum smoothing changes take effect
+locally without CONFIG.
 Resizing history preserves the newest rows that fit and does not reset other measurements.
 
-Mode, band, Sweep time, FFT size, sample rate, dwell, CCA attempts and the three
-display settings are saved locally. Port names, USB identifiers and automatic
+Mode, band, Sweep time, FFT size, sample rate, dwell, CCA attempts, display refresh,
+history, utilization aggregation and spectrum smoothing selections are saved locally.
+Port names, USB identifiers and automatic
 connection/start are not saved. **Reset defaults** restores the saved selections;
 use **Apply** to send them to a connected device.
 The effective dwell and measured cycle time are read back separately: the requested

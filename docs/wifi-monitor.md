@@ -121,7 +121,7 @@ Only valid windows contribute to either counter sum or the time-bound sum. Faile
 
 The UI identifies this source as sampled PHY CCA (experimental). Tooltips expose the latest raw measurement separately from the displayed aggregate, including valid/attempted counts, raw counter sums and the sum of window-time upper bounds. This time bound is not the interval from the first sample to the last, nor the whole dwell duration.
 
-The aggregation setting uses the latest 1–16 valid visits per channel, with a default of four; one selects the latest raw ratio. Aggregate metadata identifies the contributing visit count and time span. Invalid or missing measurements clear that channel's history instead of treating failure as idle. Epoch, band and source changes clear the histories.
+The Utilization dropdown selects Raw (the latest valid ratio) or Average (the latest 2–16 valid visits per channel, with a default of four). The separate Util visits field sets the averaging count. Aggregate metadata identifies the contributing visit count and time span. Invalid or missing measurements clear that channel's history instead of treating failure as idle. Epoch, band and source changes clear the histories.
 
 Live replaces individual channels as observations arrive and retains other channels' last measurements while the next traversal is in progress. Starting a new cycle does not clear the whole chart. A known invalid CCA result or failed receive dwell clears its channel; an FFT-only `spectrum_capture` failure preserves valid CCA data and history. Cycle closure removes unobserved channels, and advancing past a lost marker expires missing observations from that incomplete cycle. Sweep publishes staged results atomically at cycle completion and breaks aggregation history across known missing channel visits. Retained results are last measurements, not evidence of continuous reception.
 Increasing the aggregate visit count changes the display's temporal averaging, not the physical integration window or accuracy. Increasing dwell alone does not add CCA windows; the configured attempt count controls that target.
@@ -136,6 +136,14 @@ The [RF frame contract](tlv-protocol.md#35-0x04-spectrum_rf-device--pc) defines 
 The firmware subtracts each snapshot's complex I/Q mean before windowing and FFT. This removes the DC component that otherwise produces a peak at every tuned channel center. It also suppresses a genuine exact-center component and changes the adjacent Hann-window bins; this is not absolute RF calibration or a method for measuring an exact-center continuous-wave tone.
 The GUI resamples bins within each captured span onto the shared frequency grid; it does not infer measurements outside those spans.
 Current and waterfall use the real FFT data; peak hold intentionally retains historical maxima until reset.
+The optional Spectrum smooth display setting applies a centered moving average
+to the Current curve only; its default is Off.
+Smooth width selects an odd number of display-grid frequency bins from 3 to 31,
+with a default of 5. The operation is an arithmetic mean of the dB display values,
+not a linear-power average. Windows stop at the boundaries of each continuous
+finite region, and missing bins remain missing. Smoothing does not modify raw
+measurements, Peak Hold, Waterfall or CCA values, and does not send device CONFIG.
+The same display option applies to Demo; it does not improve RF accuracy or calibration.
 In both Live and Sweep, Waterfall publishes exactly one row per accepted cycle
 marker. Live updates the spectrum immediately but leaves Waterfall unchanged
 until scan completion. Only that cycle's captured coverage enters its row;

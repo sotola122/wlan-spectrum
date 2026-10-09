@@ -31,7 +31,7 @@ import time
 
 import numpy as np
 from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QScrollArea
 
 from wifi_spectrum import tlv
 from wifi_spectrum.bands import BANDS, channel_freq
@@ -54,6 +54,21 @@ SYNTH_FFT_SIZES = [64, 128, 256]
 SYNTHETIC_RUN = False
 SYNTH_RATES = [{"code": 0, "span_khz": 20000},
                {"code": 1, "span_khz": 40000}]
+def interior_smooth_probe_index(values: np.ndarray) -> int:
+    best_j = None
+    best_score = 0.0
+    for j in range(1, len(values) - 1):
+        if not (np.isfinite(values[j]) and np.isfinite(values[j - 1])
+                and np.isfinite(values[j + 1])):
+            continue
+        nb_mean = 0.5 * (float(values[j - 1]) + float(values[j + 1]))
+        score = abs(float(values[j]) - nb_mean)
+        if score > best_score:
+            best_score = score
+            best_j = j
+    if best_j is None or best_score < 0.5:
+        raise HarnessError("no interior bin variation for smooth probe")
+    return best_j
 
 
 class HarnessError(RuntimeError):
@@ -721,13 +736,62 @@ def step_demo_restore(win: MainWindow, shots) -> None:
 
 
 # ----------------------------------------------------------------- main
+def step_spectrum_smooth_display(win: MainWindow, shots, writes) -> None:
+    """Toggle display-only spectrum smooth; CONFIG count must not change.
+
+    Pause first. The synthetic device keeps streaming, so a snapshot taken
+    while playback is on is overwritten before the storage assert runs.
+    """
+    wait(lambda: np.isfinite(win.cur).any(), 8.0, "RF cur before smooth step")
+    win.play_btn.setChecked(False)
+    APP.processEvents()
+    try:
+        win._render()
+        mid = interior_smooth_probe_index(win.cur)
+        writes_before = len(writes)
+        win.smooth_mode_combo.setCurrentIndex(0)
+        win._dirty = True
+        win._render()
+        plotted = win.cur_curve.getData()[1]
+        check(plotted is not None, "curve data before smooth-off")
+        assert plotted is not None
+        off_plot = float(plotted[mid])
+        cur_save = win.cur.copy()
+        peak_save = win.peak.copy()
+        wf_save = win.wf.copy()
+        if shots:
+            shot(win, shots / "smooth-off.png")
+        win.smooth_mode_combo.setCurrentIndex(1)
+        win.smooth_bins_spin.setValue(7)
+        win._dirty = True
+        win._render()
+        plotted_on = win.cur_curve.getData()[1]
+        check(plotted_on is not None, "curve data after smooth-on")
+        assert plotted_on is not None
+        on_plot = float(plotted_on[mid])
+        check(len(writes) == writes_before,
+              f"smooth must not send CONFIG ({writes_before} -> {len(writes)})")
+        np.testing.assert_array_equal(win.cur, cur_save)
+        np.testing.assert_array_equal(win.peak, peak_save)
+        np.testing.assert_array_equal(win.wf, wf_save)
+        check(abs(on_plot - off_plot) > 0.01,
+              f"display curve must change (off={off_plot} on={on_plot})")
+        if shots:
+            shot(win, shots / "smooth-on.png")
+        print("[ok] spectrum smooth display-only (buffers unchanged, no CONFIG)")
+    finally:
+        win.play_btn.setChecked(True)
+        APP.processEvents()
+
+
 def step_settings_nondefault(win: MainWindow, shots, writes) -> None:
     """Physical-ready: nondefault dwell/attempts travel as ONE Apply
     CONFIG (7 fields), the device's matching echo is accepted, and a
     display-only knob change never emits a CONFIG."""
     base = len(writes)
     win.attempts_spin.setValue(7)
-    win.dwell_spin.setValue(300)
+    win.dwell_mode_combo.setCurrentIndex(1)
+    win.dwell_ms_spin.setValue(300)
     win.apply_btn.click()
     wait(lambda: len(writes) > base, 5.0,
          "Apply CONFIG with nondefault dwell/attempts")
@@ -753,13 +817,51 @@ def step_settings_nondefault(win: MainWindow, shots, writes) -> None:
     print("[ok] nondefault dwell/attempt Apply + display-only isolation")
 
 
+def step_topbar_single_row(win: MainWindow, shots, port: str) -> None:
+    """One horizontal toolbar row; acquisition and connection stay visible."""
+    topbar = win.findChild(QFrame, "topbar")
+    if not isinstance(topbar, QFrame):
+        raise HarnessError("topbar missing")
+    check(isinstance(topbar.layout(), QHBoxLayout),
+          "topbar must be a single horizontal row")
+    controls = (win.mode_tabs, win.play_btn, win.demo_btn,
+                win.port_combo, win.connect_btn)
+    for width, height in ((1480, 940), (1280, 720)):
+        win.resize(width, height)
+        APP.processEvents()
+        check((win.width(), win.height()) == (width, height),
+              f"window must be {width}x{height}")
+        check(topbar.height() <= 72, "topbar must not wrap to two rows")
+        bar = topbar.rect()
+        for w in controls:
+            g = w.rect().translated(w.mapTo(topbar, QPoint(0, 0)))
+            check(bar.contains(g), f"{w.objectName()} clips topbar at "
+                  f"{width}x{height}")
+        if shots:
+            shot(win, shots / f"topbar-{width}x{height}.png")
+    long_port = "COM_PORT_SYNTHETIC_VERY_LONG_LABEL_EXAMPLE"
+    win.port_combo.addItem(long_port)
+    win.port_combo.setCurrentText(long_port)
+    APP.processEvents()
+    check(win.port_combo.width() <= 108, "port field must stay bounded")
+    check("SYNTHETIC" in win.port_combo.toolTip(),
+          "long port label must be available in tooltip")
+    win.port_combo.setCurrentText(port)
+    APP.processEvents()
+    win.resize(1480, 940)
+    APP.processEvents()
+    print("[ok] single-row topbar fits 1480x940 and 1280x720")
+
+
 def step_settings_fit(win: MainWindow, shots) -> None:
     """New settings plus Apply/Reset stay on screen at both target sizes."""
     scroll = win.findChild(QScrollArea)
     if not isinstance(scroll, QScrollArea):
         raise HarnessError("sidebar scroll area missing")
-    names = ("dwell_spin", "attempts_spin", "fps_spin", "hist_spin",
-             "agg_spin", "apply_btn", "reset_settings_btn")
+    names = ("dwell_mode_combo", "dwell_ms_spin", "attempts_spin", "fps_spin",
+             "hist_spin", "util_mode_combo", "util_visits_spin",
+             "smooth_mode_combo", "smooth_bins_spin",
+             "apply_btn", "reset_settings_btn")
     for width, height in ((1480, 940), (1280, 720)):
         win.resize(width, height)
         APP.processEvents()
@@ -811,11 +913,15 @@ def run_harness(port: str, baud: int, shots_dir: str | None,
     SerialReader.write = observing_write  # type: ignore[method-assign]
 
     steps = [
+        ("topbar single row",
+         lambda: step_topbar_single_row(win, shots, port)),
         ("settings fit", lambda: step_settings_fit(win, shots)),
         ("demo baseline", lambda: step_demo_baseline(win, shots)),
         ("connect", lambda: step_connect(win)),
         ("rf ready", lambda: step_rf_ready(win, shots, ready_timeout)),
         ("frame rendering", lambda: step_frame_renders(win, shots)),
+        ("spectrum smooth display",
+         lambda: step_spectrum_smooth_display(win, shots, writes)),
         ("display controls", lambda: step_display_controls(win, shots)),
         ("fft/rate controls",
          lambda: step_fft_rate_requests(win, shots, writes)),
